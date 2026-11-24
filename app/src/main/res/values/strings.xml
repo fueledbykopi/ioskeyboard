@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">iKeys</string>
+    <string name="ime_name">iKeys</string>
+    <string name="subtype_en_us">English (US) – iOS Layout</string>
+    <string name="subtype_id_id">Bahasa Indonesia – iOS Layout</string>
+</resources>
