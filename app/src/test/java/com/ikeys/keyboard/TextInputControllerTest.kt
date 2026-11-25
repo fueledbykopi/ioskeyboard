@@ -78,4 +78,15 @@ class TextInputControllerTest {
         assertEquals(8, TextInputController.computeWordBackspaceCount("hello world   "))
         assertEquals(5, TextInputController.computeWordBackspaceCount("hello"))
     }
+
+    @Test
+    fun extractsCurrentAndPreviousWordsForNextWordPredictions() {
+        val ctrl = TextInputController()
+        assertEquals("morn", ctrl.extractCurrentWord("Good morn"))
+        assertEquals("Good", ctrl.extractPreviousWord("Good morn"))
+        assertEquals("", ctrl.extractCurrentWord("Good "))
+        assertEquals("Good", ctrl.extractPreviousWord("Good "))
+        assertEquals("", ctrl.extractPreviousWord("Good. "))
+        assertEquals("terima", ctrl.extractPreviousWord("terima "))
+    }
 }

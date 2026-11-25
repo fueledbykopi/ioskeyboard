@@ -3,6 +3,7 @@ package com.ikeys.keyboard
 import com.ikeys.keyboard.prediction.SuggestionEngine
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -48,9 +49,36 @@ class SuggestionEngineTest {
     }
 
     @Test
-    fun learnsCustomUserWordsDynamically() {
+    fun doesNotAggressivelyAutoCorrectValidPartialPrefixes() {
+        // Typing "hel" should suggest "hello" as a completion, not force-replace on space
+        assertNull(engine.autoCorrectFor("hel"))
+    }
+
+    @Test
+    fun predictsContextualNextWordsUsingBigrams() {
+        val afterGood = engine.suggest(currentWord = "", previousWord = "Good")
+        assertTrue(afterGood.any { it.text.equals("morning", ignoreCase = true) })
+
+        val afterTerima = engine.suggest(currentWord = "", previousWord = "terima")
+        assertTrue(afterTerima.any { it.text.equals("kasih", ignoreCase = true) })
+    }
+
+    @Test
+    fun learnsCustomUserWordsTransitionsAndPersistsCsv() {
         engine.learnWord("Antigravity", boost = 500)
+        engine.learnTransition("hello", "Antigravity", boost = 200)
+
         val results = engine.suggest("Antig")
         assertTrue(results.any { it.text.equals("Antigravity", ignoreCase = true) })
+
+        val next = engine.suggest(currentWord = "", previousWord = "hello")
+        assertTrue(next.any { it.text == "Antigravity" })
+
+        val csv = engine.exportUserWordsCsv()
+        assertTrue(csv.contains("Antigravity"))
+
+        val fresh = SuggestionEngine()
+        fresh.loadUserWordsCsv(csv)
+        assertTrue(fresh.suggest("Antig").any { it.text.equals("Antigravity", ignoreCase = true) })
     }
 }

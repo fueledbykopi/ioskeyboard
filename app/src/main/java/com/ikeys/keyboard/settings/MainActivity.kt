@@ -7,6 +7,7 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.provider.Settings
+import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.inputmethod.InputMethodManager
@@ -15,9 +16,11 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
+import com.ikeys.keyboard.prefs.BlurIntensity
 import com.ikeys.keyboard.prefs.HapticStrength
 import com.ikeys.keyboard.prefs.HeightPreset
 import com.ikeys.keyboard.prefs.IKeysPreferences
+import com.ikeys.keyboard.prefs.KeyboardStyle
 import com.ikeys.keyboard.prefs.ThemeMode
 
 /**
@@ -119,24 +122,48 @@ class MainActivity : Activity() {
         root.addView(sectionHeader("LIVE TEST SANDBOX"))
         val sandboxCard = createCard()
         val sandboxInput = EditText(this).apply {
-            hint = "Tap here to try iKeys… Hold Spacebar for Trackpad or hold A / E / O for accents."
+            hint = "Tap here to test Liquid Glass, Frosted Blur, QuickType predictions & Globe switcher…"
             setHintTextColor(secondaryText)
             setTextColor(primaryText)
             textSize = 16f
             background = null
-            minLines = 2
+            inputType = InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                InputType.TYPE_TEXT_FLAG_CAP_SENTENCES or
+                InputType.TYPE_TEXT_FLAG_AUTO_CORRECT
+            minLines = 3
             gravity = Gravity.TOP or Gravity.START
             setPadding(dp(14), dp(12), dp(14), dp(12))
         }
         sandboxCard.addView(sandboxInput)
         root.addView(sandboxCard)
 
-        // 3. Appearance & Layout
-        root.addView(sectionHeader("APPEARANCE & LAYOUT"))
+        // 3. Appearance & Material
+        root.addView(sectionHeader("APPEARANCE & GLASS MATERIAL"))
         val appearanceCard = createCard()
         appearanceCard.addView(
             createSegmentedRow(
-                label = "Theme",
+                label = "Keyboard Style",
+                subtitle = "iOS 26 Liquid Glass, Frosted Blur, or Classic solid keys",
+                options = KeyboardStyle.entries.map { it.displayName },
+                selectedIndex = KeyboardStyle.entries.indexOf(prefs.keyboardStyle),
+                onSelected = { idx -> prefs.keyboardStyle = KeyboardStyle.entries[idx] }
+            )
+        )
+        appearanceCard.addView(createDivider())
+        appearanceCard.addView(
+            createSegmentedRow(
+                label = "Glass & Blur Intensity",
+                subtitle = "Live backdrop blur on Android 12+ with adaptive glass fallback",
+                options = BlurIntensity.entries.map { it.displayName },
+                selectedIndex = BlurIntensity.entries.indexOf(prefs.blurIntensity),
+                onSelected = { idx -> prefs.blurIntensity = BlurIntensity.entries[idx] }
+            )
+        )
+        appearanceCard.addView(createDivider())
+        appearanceCard.addView(
+            createSegmentedRow(
+                label = "Color Theme",
                 options = ThemeMode.entries.map { it.displayName },
                 selectedIndex = ThemeMode.entries.indexOf(prefs.themeMode),
                 onSelected = { idx -> prefs.themeMode = ThemeMode.entries[idx] }
@@ -164,7 +191,7 @@ class MainActivity : Activity() {
         appearanceCard.addView(
             createToggleRow(
                 title = "Bottom iPhone Chin Bar",
-                subtitle = "Globe switcher & keyboard dismiss icons below spacebar",
+                subtitle = "Tap Globe to switch keyboard, hold Globe for picker • Dismiss on right",
                 initialValue = prefs.bottomChinEnabled,
                 onChange = { prefs.bottomChinEnabled = it }
             )
@@ -415,6 +442,7 @@ class MainActivity : Activity() {
         label: String,
         options: List<String>,
         selectedIndex: Int,
+        subtitle: String? = null,
         onSelected: (Int) -> Unit
     ): LinearLayout {
         val container = LinearLayout(this).apply {
@@ -425,8 +453,16 @@ class MainActivity : Activity() {
             text = label
             textSize = 15.5f
             setTextColor(primaryText)
-            setPadding(0, 0, 0, dp(8))
+            setPadding(0, 0, 0, if (subtitle == null) dp(8) else dp(2))
         })
+        if (subtitle != null) {
+            container.addView(TextView(this).apply {
+                text = subtitle
+                textSize = 12.5f
+                setTextColor(secondaryText)
+                setPadding(0, 0, 0, dp(8))
+            })
+        }
 
         val track = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL

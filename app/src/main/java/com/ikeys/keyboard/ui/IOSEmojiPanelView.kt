@@ -2,9 +2,11 @@ package com.ikeys.keyboard.ui
 
 import android.content.Context
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -186,9 +188,23 @@ class IOSEmojiPanelView(context: Context) : LinearLayout(context) {
         applyTheme(IOSKeyboardTheme.Light)
     }
 
-    fun applyTheme(newTheme: IOSKeyboardTheme) {
+    fun applyTheme(newTheme: IOSKeyboardTheme, hardwareBlurActive: Boolean = false) {
         theme = newTheme
-        setBackgroundColor(theme.keyboardBg)
+        if (hardwareBlurActive && theme.useWindowBlur) {
+            setBackgroundColor(Color.TRANSPARENT)
+        } else if (theme.topCornerRadiusDp > 0f) {
+            val topR = theme.topCornerRadiusDp * density
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadii = floatArrayOf(topR, topR, topR, topR, 0f, 0f, 0f, 0f)
+                setColor(theme.effectiveBackdropColor(hardwareBlurActive = false))
+                if (theme.isGlassStyle) {
+                    setStroke(dp(1).coerceAtLeast(1), theme.topBorderColor)
+                }
+            }
+        } else {
+            setBackgroundColor(theme.keyboardBg)
+        }
         headerTitle.setTextColor(theme.chinIconColor)
         abcButton.setTextColor(theme.keySpecialText)
         delButton.setTextColor(theme.keySpecialText)
@@ -207,7 +223,16 @@ class IOSEmojiPanelView(context: Context) : LinearLayout(context) {
 
     private fun updateTabVisuals() {
         tabViews.forEachIndexed { idx, tv ->
-            tv.alpha = if (idx == selectedCategoryIndex) 1.0f else 0.45f
+            val isSelected = idx == selectedCategoryIndex
+            tv.alpha = if (isSelected) 1.0f else 0.45f
+            tv.background = if (isSelected) {
+                GradientDrawable().apply {
+                    setColor(theme.emojiTabActiveBg)
+                    cornerRadius = dp(10).toFloat()
+                }
+            } else {
+                null
+            }
         }
     }
 

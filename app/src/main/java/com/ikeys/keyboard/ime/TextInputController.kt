@@ -146,6 +146,31 @@ class TextInputController {
     }
 
     /**
+     * Extracts the completed word immediately preceding the current word (or trailing space)
+     * so QuickType can deliver contextual next-word bigram predictions.
+     */
+    fun extractPreviousWord(textBeforeCursor: CharSequence?): String {
+        if (textBeforeCursor.isNullOrEmpty()) return ""
+        var i = textBeforeCursor.length - 1
+        // Skip current partial word if cursor is mid-word
+        while (i >= 0 && (textBeforeCursor[i].isLetter() || textBeforeCursor[i] == '\'')) {
+            i--
+        }
+        // Require at least one horizontal space separator (don't bridge across sentence boundaries)
+        var sawSpace = false
+        while (i >= 0 && textBeforeCursor[i] == ' ') {
+            sawSpace = true
+            i--
+        }
+        if (!sawSpace || i < 0) return ""
+        val end = i + 1
+        while (i >= 0 && (textBeforeCursor[i].isLetter() || textBeforeCursor[i] == '\'')) {
+            i--
+        }
+        return textBeforeCursor.substring(i + 1, end)
+    }
+
+    /**
      * Returns true if the cursor is at the start of text, after newline, or after sentence-ending punctuation + space.
      */
     fun shouldAutoCapitalize(textBeforeCursor: CharSequence?): Boolean {
