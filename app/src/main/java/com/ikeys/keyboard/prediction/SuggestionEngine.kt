@@ -23,8 +23,10 @@ class SuggestionEngine {
         var word: String? = null
         var frequency: Int = 0
         var langTag: Byte = LANG_BOTH // 0=both, 1=en, 2=id
-        // Pre-ranked top completions in this subtree (kept sorted descending by frequency)
-        val topNodes = ArrayList<TrieNode>(TOP_K_PER_NODE)
+        // Separate per-language pre-ranked Top-K caches so EN and ID never evict each other!
+        val topEnNodes = ArrayList<TrieNode>(TOP_K_PER_LANG)
+        val topIdNodes = ArrayList<TrieNode>(TOP_K_PER_LANG)
+        val topUserNodes = ArrayList<TrieNode>(TOP_K_USER)
     }
 
     private val root = TrieNode()
@@ -414,14 +416,18 @@ class SuggestionEngine {
         }
         node.frequency += frequency
 
-        // Maintain pre-ranked Top-K list on every ancestor along the prefix path -> O(1) runtime lookup!
+        // Maintain separate per-language Top-K caches on every ancestor -> O(1) lookup, zero cross-language eviction!
         for (i in 1 until path.size) {
-            updateTopNodes(path[i], node)
+            val ancestor = path[i]
+            when (langTag) {
+                LANG_EN -> updateTopList(ancestor.topEnNodes, node, TOP_K_PER_LANG)
+                LANG_ID -> updateTopList(ancestor.topIdNodes, node, TOP_K_PER_LANG)
+                else -> updateTopList(ancestor.topUserNodes, node, TOP_K_USER)
+            }
         }
     }
 
-    private fun updateTopNodes(ancestor: TrieNode, leaf: TrieNode) {
-        val list = ancestor.topNodes
+    private fun updateTopList(list: ArrayList<TrieNode>, leaf: TrieNode, limit: Int) {
         var existingIdx = -1
         for (i in list.indices) {
             if (list[i] === leaf) {
@@ -430,7 +436,6 @@ class SuggestionEngine {
             }
         }
         if (existingIdx >= 0) {
-            // Bubble up if frequency increased
             var pos = existingIdx
             while (pos > 0 && list[pos].frequency > list[pos - 1].frequency) {
                 val tmp = list[pos - 1]
@@ -440,7 +445,7 @@ class SuggestionEngine {
             }
             return
         }
-        if (list.size < TOP_K_PER_NODE) {
+        if (list.size < limit) {
             list.add(leaf)
             var pos = list.lastIndex
             while (pos > 0 && list[pos].frequency > list[pos - 1].frequency) {
@@ -470,41 +475,45 @@ class SuggestionEngine {
     }
 
     /**
-     * Ultra-fast O(prefix.length) prefix completion lookup using pre-ranked TrieNode.topNodes!
+     * Ultra-fast O(prefix.length) prefix completion lookup across per-language pre-ranked caches!
      */
     private fun collectFastPrefixMatches(prefix: String, activeLang: Byte, prevLower: String): List<String> {
         var node = root
         for (i in prefix.indices) {
             node = node.children[prefix[i]] ?: return emptyList()
         }
-        val candidates = node.topNodes
-        if (candidates.isEmpty()) return emptyList()
 
         val prevBigrams = if (prevLower.isNotEmpty()) bigrams[prevLower] else null
-        val scored = ArrayList<Pair<String, Int>>(candidates.size)
+        val scored = LinkedHashMap<String, Int>(16)
 
-        for (i in candidates.indices) {
-            val cand = candidates[i]
-            val w = cand.word ?: continue
-            var score = cand.frequency
-            if (activeLang != LANG_BOTH && cand.langTag == activeLang) {
-                score += 420
+        fun considerList(candidates: ArrayList<TrieNode>) {
+            for (i in candidates.indices) {
+                val cand = candidates[i]
+                val w = cand.word ?: continue
+                var score = cand.frequency
+                if (activeLang != LANG_BOTH && cand.langTag == activeLang) {
+                    score += 450
+                }
+                if (prevBigrams != null) {
+                    val bg = prevBigrams[w.lowercase()]
+                    if (bg != null) score += bg * 8
+                }
+                score -= (w.length - prefix.length).coerceAtLeast(0) * 10
+                val prev = scored[w]
+                if (prev == null || score > prev) {
+                    scored[w] = score
+                }
             }
-            if (prevBigrams != null) {
-                val bg = prevBigrams[w.lowercase()]
-                if (bg != null) score += bg * 8
-            }
-            // Subtle preference for closer-length completions
-            score -= (w.length - prefix.length).coerceAtLeast(0) * 10
-            scored.add(w to score)
         }
 
-        scored.sortByDescending { it.second }
-        val result = ArrayList<String>(scored.size)
-        for (i in scored.indices) {
-            result.add(scored[i].first)
-        }
-        return result
+        considerList(node.topUserNodes)
+        considerList(node.topEnNodes)
+        considerList(node.topIdNodes)
+
+        if (scored.isEmpty()) return emptyList()
+        return scored.entries
+            .sortedByDescending { it.value }
+            .map { it.key }
     }
 
     /**
@@ -616,7 +625,10 @@ class SuggestionEngine {
             "than", "then", "now", "look", "only", "come", "its", "over", "think", "also",
             "back", "after", "use", "two", "how", "our", "work", "first", "well", "way",
             "even", "new", "want", "because", "any", "these", "give", "day", "most", "us",
-            // Tier 2: Common verbs, forms & messaging
+            // Tier 2: High-frequency conversational words & greetings first!
+            "hello", "hey", "hi", "thanks", "thank", "please", "sorry", "good", "morning", "night",
+            "today", "tomorrow", "yesterday", "tonight", "love", "happy", "great", "awesome", "nice", "help",
+            "welcome", "sure", "okay", "ok", "yes", "yeah", "yep", "nope", "maybe", "perhaps",
             "am", "is", "are", "was", "were", "been", "being", "has", "had", "does", "did",
             "doing", "done", "going", "goes", "went", "gone", "coming", "came", "getting", "got",
             "making", "made", "taking", "took", "taken", "looking", "looked", "working", "worked", "works",
@@ -629,13 +641,12 @@ class SuggestionEngine {
             "finding", "found", "keeping", "kept", "leaving", "left", "bringing", "brought", "hearing", "heard",
             "meaning", "meant", "meeting", "met", "putting", "setting", "showing", "showed", "shown", "helping",
             "helped", "loving", "loved", "liking", "liked", "needing", "needed", "wanting", "wanted", "hoping",
-            "hello", "hey", "hi", "bye", "goodbye", "thanks", "thank", "please", "sorry", "excuse",
-            "welcome", "sure", "okay", "ok", "yes", "yeah", "yep", "nope", "maybe", "perhaps",
+            "bye", "goodbye", "excuse",
             "really", "actually", "literally", "basically", "honestly", "probably", "definitely", "absolutely", "totally", "completely",
             "always", "never", "sometimes", "often", "usually", "already", "almost", "still", "yet", "soon",
-            "later", "today", "tomorrow", "yesterday", "tonight", "morning", "afternoon", "evening", "night", "weekend",
+            "later", "afternoon", "evening", "weekend",
             "week", "weeks", "month", "months", "minute", "minutes", "hour", "hours", "second", "seconds", "days", "years",
-            "great", "awesome", "amazing", "nice", "cool", "best", "better", "worse", "worst", "fine",
+            "amazing", "cool", "best", "better", "worse", "worst", "fine",
             "perfect", "beautiful", "wonderful", "fantastic", "lovely", "happy", "glad", "excited", "proud", "grateful",
             "sad", "tired", "busy", "free", "ready", "late", "early", "fast", "quick", "quickly", "slow", "slowly",
             "easy", "easily", "hard", "simple", "clean", "smooth", "bright", "dark", "light", "heavy", "small",
@@ -736,16 +747,25 @@ class SuggestionEngine {
             "padahal", "walaupun", "meskipun", "sebenarnya", "soalnya", "akhirnya", "langsung", "segera", "lumayan"
         )
 
-        val enTotal = englishWords.size
-        englishWords.forEachIndexed { idx, word ->
-            val score = (enTotal - idx) * 2 + 250
-            insert(word, score, LANG_EN)
+        // Normalize frequency tiers equally across EN and ID and deduplicate so no word gets double-counted
+        val seenEn = HashSet<String>(englishWords.size)
+        var enRank = 0
+        for (word in englishWords) {
+            if (seenEn.add(word.lowercase())) {
+                val score = (1200 - enRank * 2).coerceAtLeast(180)
+                insert(word, score, LANG_EN)
+                enRank++
+            }
         }
 
-        val idTotal = indonesianWords.size
-        indonesianWords.forEachIndexed { idx, word ->
-            val score = (idTotal - idx) * 2 + 250
-            insert(word, score, LANG_ID)
+        val seenId = HashSet<String>(indonesianWords.size)
+        var idRank = 0
+        for (word in indonesianWords) {
+            if (seenId.add(word.lowercase())) {
+                val score = (1200 - idRank * 2).coerceAtLeast(180)
+                insert(word, score, LANG_ID)
+                idRank++
+            }
         }
     }
 
@@ -903,7 +923,8 @@ class SuggestionEngine {
     }
 
     companion object {
-        private const val TOP_K_PER_NODE = 10
+        private const val TOP_K_PER_LANG = 8
+        private const val TOP_K_USER = 6
         private const val LANG_BOTH: Byte = 0
         private const val LANG_EN: Byte = 1
         private const val LANG_ID: Byte = 2
