@@ -3,8 +3,10 @@ package com.ikeys.keyboard.ui
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.LinearGradient
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.RadialGradient
 import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
@@ -30,16 +32,12 @@ import kotlin.math.abs
 
 /**
  * Ultra-low-latency hardware-accelerated Canvas keyboard view engineered for the latest iOS 26 look & feel:
- * - Zero-allocation onDraw() & onTouchEvent()
- * - Authentic iOS 26 Liquid Glass (floating rounded tray, optical glass keycaps, specular top sheen & rims),
- *   Frosted Blur (smooth frosted translucency), and Classic Solid styles
- * - Integrated QuickType suggestion bar with glass pill highlights & multi-touch-safe pointer tracking
- * - Smooth Bézier teardrop key preview popups + fading tail animation
- * - Long-press diacritics / alternate character slide-to-select pill bar
- * - Multi-touch rollover typing for fast two-thumb input
- * - Spacebar long-press trackpad cursor control with keycap fade-out & language badge flash
- * - Accelerated backspace repeat (character -> whole word) & swipe-left word delete
- * - iPhone-style bottom chin (Globe tap-to-switch + long-press picker, & Keyboard Dismiss)
+ * - Zero-allocation onDraw() & onTouchEvent() via cached GPU shaders + local matrix translation
+ * - True iOS 26 Liquid Glass: 3-stop optical glass keys (top specular -> translucent body -> bottom caustic),
+ *   Fresnel gradient rims, ambient refractive blooms, floating glass suggestion capsule, & blue glass Return capsule
+ * - True iOS Frosted Blur: silky matte frosted acrylic grain + live Android 12+ backdrop blur
+ * - Multi-touch rollover typing, Bézier glass teardrop popups, long-press diacritics, spacebar trackpad,
+ *   and pointer-isolated QuickType & Globe chin actions
  */
 class IOSKeyboardView(context: Context) : View(context) {
 
@@ -90,19 +88,33 @@ class IOSKeyboardView(context: Context) : View(context) {
     private val regularTypeface = Typeface.create("sans-serif", Typeface.NORMAL)
     private val mediumTypeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
 
-    // Reusable Paints, Paths, and RectFs (ZERO allocation during onDraw)
+    // Reusable Paints, Shaders, Matrix, Paths, and RectFs (ZERO allocation during onDraw)
     private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val backdropSheenPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val deckGradPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val ambientGlowPaintA = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val ambientGlowPaintB = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val frostNoisePaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val topRimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
     }
+
     private val keyPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val keySheenPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val keyGradientPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val keyBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
     }
     private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    // Cached GPU shaders translated per key via shaderMatrix (0 allocations per draw call!)
+    private val shaderMatrix = Matrix()
+    private var charKeyShader: LinearGradient? = null
+    private var specialKeyShader: LinearGradient? = null
+    private var blueActionShader: LinearGradient? = null
+    private var charRimShader: LinearGradient? = null
+    private var specialRimShader: LinearGradient? = null
+    private var popupShader: LinearGradient? = null
+
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
         typeface = regularTypeface
@@ -118,7 +130,7 @@ class IOSKeyboardView(context: Context) : View(context) {
     private val popupFillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val popupStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = dp(0.75f)
+        strokeWidth = dp(0.85f)
     }
     private val popupTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
@@ -234,6 +246,14 @@ class IOSKeyboardView(context: Context) : View(context) {
         bottomChinEnabled: Boolean,
         heightPreset: HeightPreset
     ) {
+        val configUnchanged = this.theme == theme &&
+            this.hardwareBlurActive == hardwareBlurActive &&
+            this.popupEnabled == popupEnabled &&
+            this.suggestionBarEnabled == suggestionBarEnabled &&
+            this.bottomChinEnabled == bottomChinEnabled &&
+            this.heightPreset == heightPreset
+        if (configUnchanged) return
+
         val needsRelayout = this.suggestionBarEnabled != suggestionBarEnabled ||
             this.bottomChinEnabled != bottomChinEnabled ||
             this.heightPreset != heightPreset ||
@@ -246,7 +266,6 @@ class IOSKeyboardView(context: Context) : View(context) {
         this.bottomChinEnabled = bottomChinEnabled
         this.heightPreset = heightPreset
 
-        // Slightly bolder legibility on translucent Liquid Glass (matches iOS 26 optical typography)
         textPaint.typeface = if (theme.isGlassStyle) mediumTypeface else regularTypeface
         suggestionPaint.typeface = if (theme.isGlassStyle) mediumTypeface else regularTypeface
         popupTextPaint.typeface = if (theme.isGlassStyle) mediumTypeface else regularTypeface
@@ -255,7 +274,7 @@ class IOSKeyboardView(context: Context) : View(context) {
             requestLayout()
         }
         recomputeGeometry(width)
-        rebuildBackdropPaths(width.toFloat(), height.toFloat())
+        rebuildBackdropAndShaders(width.toFloat(), height.toFloat())
         invalidate()
     }
 
@@ -265,6 +284,13 @@ class IOSKeyboardView(context: Context) : View(context) {
         shift: ShiftState,
         returnAction: ReturnAction
     ) {
+        if (this.keyboardMode == mode &&
+            this.inputVariant == variant &&
+            this.shiftState == shift &&
+            this.returnAction == returnAction
+        ) {
+            return
+        }
         val layoutChanged = this.keyboardMode != mode || this.inputVariant != variant
         this.keyboardMode = mode
         this.inputVariant = variant
@@ -278,13 +304,11 @@ class IOSKeyboardView(context: Context) : View(context) {
     }
 
     fun setSuggestions(items: List<SuggestionItem>) {
+        if (this.suggestions == items) return
         this.suggestions = items
         invalidate()
     }
 
-    /**
-     * Briefly displays the active language name on the spacebar (authentic iOS language-switch indicator).
-     */
     fun flashSpacebarLanguage(label: String) {
         spacebarBannerText = label
         spacebarBannerUntilMs = SystemClock.uptimeMillis() + SPACEBAR_BANNER_DURATION_MS
@@ -313,7 +337,7 @@ class IOSKeyboardView(context: Context) : View(context) {
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         recomputeGeometry(w)
-        rebuildBackdropPaths(w.toFloat(), h.toFloat())
+        rebuildBackdropAndShaders(w.toFloat(), h.toFloat())
     }
 
     private fun recomputeGeometry(viewWidth: Int) {
@@ -328,7 +352,7 @@ class IOSKeyboardView(context: Context) : View(context) {
         val rowGap = dp(ROW_GAP_DP)
         chinTopPx = keyAreaTopPx + rowH * 4f + rowGap * 3f + dp(KEYS_BOTTOM_PAD_DP)
 
-        val horizPad = if (theme.isGlassStyle) dp(5f) else dp(3.5f)
+        val horizPad = if (theme.isGlassStyle) dp(6f) else dp(3.5f)
         val keyGapX = if (theme.isGlassStyle) dp(5.8f) else dp(5.5f)
 
         val rows = IOSKeyboardLayout.rowsFor(keyboardMode, inputVariant)
@@ -345,9 +369,9 @@ class IOSKeyboardView(context: Context) : View(context) {
         )
     }
 
-    private fun rebuildBackdropPaths(w: Float, h: Float) {
+    private fun rebuildBackdropAndShaders(w: Float, h: Float) {
         if (w <= 0f || h <= 0f) return
-        val topR = dp(theme.topCornerRadiusDp).coerceAtMost(w * 0.15f)
+        val topR = dp(theme.topCornerRadiusDp).coerceAtMost(w * 0.16f)
         backdropRadii[0] = topR
         backdropRadii[1] = topR
         backdropRadii[2] = topR
@@ -361,9 +385,9 @@ class IOSKeyboardView(context: Context) : View(context) {
         reusableRect.set(0f, 0f, w, h)
         backdropPath.addRoundRect(reusableRect, backdropRadii, Path.Direction.CW)
 
-        // Luminous top glass curve rim path (left curve -> top edge -> right curve)
+        // Luminous top curved glass rim path
         topRimPath.reset()
-        val inset = dp(0.6f)
+        val inset = dp(0.7f)
         if (topR > 1f) {
             topRimPath.moveTo(inset, topR)
             reusableRect.set(inset, inset, inset + topR * 2f, inset + topR * 2f)
@@ -376,19 +400,120 @@ class IOSKeyboardView(context: Context) : View(context) {
             topRimPath.lineTo(w, inset)
         }
 
-        // Cache optical glass backdrop sheen gradient (only allocated on size/theme change)
+        val rowH = dp(heightPreset.rowHeightDp).coerceAtLeast(1f)
+
         if (theme.isTranslucentStyle) {
-            backdropSheenPaint.shader = LinearGradient(
+            // Deck ambient optical gradient
+            deckGradPaint.shader = LinearGradient(
                 0f,
                 0f,
                 0f,
                 h,
-                intArrayOf(theme.backdropGradientTop, 0x00000000, theme.backdropGradientBottom),
-                floatArrayOf(0f, 0.42f, 1f),
+                intArrayOf(theme.deckGradTop, theme.deckGradMid, theme.deckGradBottom),
+                floatArrayOf(0f, 0.45f, 1f),
+                Shader.TileMode.CLAMP
+            )
+
+            // Dual subtle iridescent glass light blooms (gives Liquid Glass real optical depth!)
+            ambientGlowPaintA.shader = if ((theme.deckAmbientGlowA ushr 24) > 0) {
+                RadialGradient(
+                    w * 0.18f,
+                    h * 0.08f,
+                    w * 0.62f,
+                    theme.deckAmbientGlowA,
+                    0x00000000,
+                    Shader.TileMode.CLAMP
+                )
+            } else {
+                null
+            }
+            ambientGlowPaintB.shader = if ((theme.deckAmbientGlowB ushr 24) > 0) {
+                RadialGradient(
+                    w * 0.84f,
+                    h * 0.25f,
+                    w * 0.58f,
+                    theme.deckAmbientGlowB,
+                    0x00000000,
+                    Shader.TileMode.CLAMP
+                )
+            } else {
+                null
+            }
+
+            // Tileable micro-frosted acrylic grain texture (cached singleton, ~36KB)
+            if (theme.frostNoiseAlpha > 0) {
+                frostNoisePaint.shader = IOSKeyboardTheme.getFrostNoiseShader(theme.isDark)
+                frostNoisePaint.alpha = theme.frostNoiseAlpha
+            } else {
+                frostNoisePaint.shader = null
+            }
+
+            // 3-stop optical glass keycap shaders (translated per key with 0 allocations!)
+            charKeyShader = LinearGradient(
+                0f,
+                0f,
+                0f,
+                rowH,
+                intArrayOf(theme.keyCharTop, theme.keyCharMid, theme.keyCharBottom),
+                floatArrayOf(0f, 0.54f, 1f),
+                Shader.TileMode.CLAMP
+            )
+            specialKeyShader = LinearGradient(
+                0f,
+                0f,
+                0f,
+                rowH,
+                intArrayOf(theme.keySpecialTop, theme.keySpecialMid, theme.keySpecialBottom),
+                floatArrayOf(0f, 0.55f, 1f),
+                Shader.TileMode.CLAMP
+            )
+            blueActionShader = LinearGradient(
+                0f,
+                0f,
+                0f,
+                rowH,
+                intArrayOf(theme.keyActionBlueTop, theme.keyActionBlueBottom),
+                null,
+                Shader.TileMode.CLAMP
+            )
+            charRimShader = LinearGradient(
+                0f,
+                0f,
+                0f,
+                rowH,
+                intArrayOf(theme.keyCharRimTop, 0x18FFFFFF, theme.keyCharRimBottom),
+                floatArrayOf(0f, 0.50f, 1f),
+                Shader.TileMode.CLAMP
+            )
+            specialRimShader = LinearGradient(
+                0f,
+                0f,
+                0f,
+                rowH,
+                intArrayOf(theme.keySpecialRimTop, 0x12FFFFFF, theme.keySpecialRimBottom),
+                floatArrayOf(0f, 0.50f, 1f),
+                Shader.TileMode.CLAMP
+            )
+            popupShader = LinearGradient(
+                0f,
+                0f,
+                0f,
+                dp(110f),
+                intArrayOf(theme.popupBgTop, theme.popupBgBottom),
+                null,
                 Shader.TileMode.CLAMP
             )
         } else {
-            backdropSheenPaint.shader = null
+            deckGradPaint.shader = null
+            ambientGlowPaintA.shader = null
+            ambientGlowPaintB.shader = null
+            frostNoisePaint.shader = null
+            charKeyShader = null
+            specialKeyShader = null
+            blueActionShader = null
+            charRimShader = null
+            specialRimShader = null
+            popupShader = null
         }
     }
 
@@ -397,7 +522,7 @@ class IOSKeyboardView(context: Context) : View(context) {
         val h = height.toFloat()
         if (w <= 0f || h <= 0f) return
 
-        // 1. Keyboard Backdrop (real blur window shows through when hardwareBlurActive == true)
+        // 1. Keyboard Backdrop (Liquid Glass / Frosted Blur / Classic)
         drawBackdrop(canvas, w, h)
 
         // 2. QuickType Suggestion Bar
@@ -405,14 +530,19 @@ class IOSKeyboardView(context: Context) : View(context) {
             drawSuggestionBar(canvas, w)
         }
 
-        // 3. Keys (iOS 26 Liquid Glass / Frosted Blur / Classic Solid)
+        // 3. Keys
         val charCornerR = dp(theme.keyCornerRadiusDp)
         val actionCornerR = dp(theme.actionCornerRadiusDp)
-        val shadowOffsetY = if (theme.isGlassStyle) dp(1.35f) else dp(1.1f)
+        val shadowOffsetY = if (theme.isGlassStyle) dp(1.55f) else dp(1.1f)
         for (i in computedKeys.indices) {
             val key = computedKeys[i]
             val isPressed = isKeyPressed(key)
-            val cornerR = if (key.spec.type == KeyType.CHARACTER) charCornerR else actionCornerR
+            val cornerR = when {
+                theme.isGlassStyle && key.spec.code == KeyCode.RETURN -> key.drawRect.height * 0.48f
+                theme.isGlassStyle && key.spec.code == KeyCode.SPACE -> dp(12.5f)
+                key.spec.type == KeyType.CHARACTER -> charCornerR
+                else -> actionCornerR
+            }
             drawKey(canvas, key, isPressed, cornerR, shadowOffsetY)
         }
 
@@ -426,9 +556,7 @@ class IOSKeyboardView(context: Context) : View(context) {
     }
 
     private fun drawBackdrop(canvas: Canvas, w: Float, h: Float) {
-        // When hardware cross-window blur is active on Android 12+, the SoftInputWindow background
-        // already renders the rounded-top real-time blur & base tint. We only overlay our subtle
-        // optical sheen + specular rim so we never double-darken the glass!
+        // Base deck color (window draws real live blur underneath when hardwareBlurActive == true)
         if (!hardwareBlurActive || !theme.useWindowBlur) {
             bgPaint.color = theme.effectiveBackdropColor(hardwareBlurActive = false)
             if (theme.topCornerRadiusDp > 0f) {
@@ -438,28 +566,40 @@ class IOSKeyboardView(context: Context) : View(context) {
             }
         }
 
-        // Subtle optical light sheen gradient on Liquid Glass & Frosted Blur
-        if (theme.isTranslucentStyle && backdropSheenPaint.shader != null) {
-            canvas.drawPath(backdropPath, backdropSheenPaint)
+        if (theme.isTranslucentStyle) {
+            // Optical vertical glass depth gradient
+            if (deckGradPaint.shader != null) {
+                canvas.drawPath(backdropPath, deckGradPaint)
+            }
+            // Subtle iridescent glass refraction blooms (Liquid Glass signature!)
+            if (ambientGlowPaintA.shader != null) {
+                canvas.drawPath(backdropPath, ambientGlowPaintA)
+            }
+            if (ambientGlowPaintB.shader != null) {
+                canvas.drawPath(backdropPath, ambientGlowPaintB)
+            }
+            // Tactile micro-frosted acrylic texture (stronger on Frosted Blur, crisp on Liquid Glass)
+            if (frostNoisePaint.shader != null) {
+                canvas.drawPath(backdropPath, frostNoisePaint)
+            }
         }
 
-        // Top specular glass rim (or classic hairline)
+        // Luminous specular glass top rim (or classic hairline)
         if (theme.topCornerRadiusDp > 0f) {
-            topRimPaint.color = theme.topBorderColor
-            topRimPaint.strokeWidth = if (theme.isGlassStyle) dp(1.15f) else dp(0.85f)
+            topRimPaint.color = theme.topRimOuter
+            topRimPaint.strokeWidth = if (theme.isGlassStyle) dp(1.35f) else dp(0.9f)
             canvas.drawPath(topRimPath, topRimPaint)
 
-            // Secondary subtle inner glass reflection band on Liquid Glass
-            if (theme.isGlassStyle && (theme.topSpecularHighlight ushr 24) > 0) {
-                topRimPaint.color = theme.topSpecularHighlight
-                topRimPaint.strokeWidth = dp(0.75f)
+            if (theme.isGlassStyle && (theme.topRimInner ushr 24) > 0) {
+                topRimPaint.color = theme.topRimInner
+                topRimPaint.strokeWidth = dp(1.0f)
                 canvas.save()
-                canvas.translate(0f, dp(1.2f))
+                canvas.translate(0f, dp(1.5f))
                 canvas.drawPath(topRimPath, topRimPaint)
                 canvas.restore()
             }
         } else {
-            bgPaint.color = theme.topBorderColor
+            bgPaint.color = theme.topRimOuter
             canvas.drawRect(0f, 0f, w, dp(0.75f), bgPaint)
         }
     }
@@ -469,51 +609,67 @@ class IOSKeyboardView(context: Context) : View(context) {
         val barBottom = suggestionBarBottomPx
         val barH = barBottom - barTop
 
-        if ((theme.suggestionBarBg ushr 24) > 0 && !theme.isTranslucentStyle) {
+        if (theme.isGlassStyle) {
+            // Floating iOS 26 Liquid Glass suggestion capsule
+            val capInsetX = dp(10f)
+            val capTop = barTop + dp(4f)
+            val capBottom = barBottom - dp(3f)
+            val capR = (capBottom - capTop) * 0.5f
+            reusableRect.set(capInsetX, capTop, viewWidth - capInsetX, capBottom)
+
+            keyPaint.color = theme.suggestionBarBg
+            canvas.drawRoundRect(reusableRect, capR, capR, keyPaint)
+
+            keyBorderPaint.shader = null
+            keyBorderPaint.color = theme.suggestionBarBorder
+            keyBorderPaint.strokeWidth = dp(0.85f)
+            canvas.drawRoundRect(reusableRect, capR, capR, keyBorderPaint)
+        } else if ((theme.suggestionBarBg ushr 24) > 0 && !theme.isTranslucentStyle) {
             bgPaint.color = theme.suggestionBarBg
             canvas.drawRect(0f, barTop + dp(0.75f), viewWidth, barBottom, bgPaint)
         }
 
-        val sideInset = if (theme.isGlassStyle) dp(10f) else dp(4f)
+        val sideInset = if (theme.isGlassStyle) dp(13f) else dp(4f)
         val usableW = (viewWidth - sideInset * 2f).coerceAtLeast(1f)
         val slotCount = 3
         val slotW = usableW / slotCount
-        val dividerTop = barTop + dp(10f)
+        val dividerTop = barTop + dp(11f)
         val dividerBottom = barBottom - dp(10f)
         val dividerW = dp(0.85f)
 
-        // Vertical iOS hairline dividers between the 3 QuickType slots
+        // Vertical hairline dividers
         bgPaint.color = theme.suggestionDivider
         val div1X = sideInset + slotW
         val div2X = sideInset + slotW * 2f
         canvas.drawRect(div1X - dividerW * 0.5f, dividerTop, div1X + dividerW * 0.5f, dividerBottom, bgPaint)
         canvas.drawRect(div2X - dividerW * 0.5f, dividerTop, div2X + dividerW * 0.5f, dividerBottom, bgPaint)
 
-        suggestionPaint.textSize = sp(15.5f)
-        val textCenterY = barTop + barH * 0.5f - (suggestionPaint.descent() + suggestionPaint.ascent()) * 0.5f
-        val pillRadius = if (theme.isGlassStyle) dp(11f) else dp(7f)
+        suggestionPaint.textSize = sp(15.2f)
+        val textCenterY = barTop + barH * 0.5f - (suggestionPaint.descent() + suggestionPaint.ascent()) * 0.5f + dp(0.4f)
+        val pillPadV = if (theme.isGlassStyle) dp(6.5f) else dp(5f)
+        val pillR = if (theme.isGlassStyle) (barH - pillPadV * 2f) * 0.5f else dp(7f)
 
         for (i in 0 until slotCount) {
             val item = suggestions.getOrNull(i) ?: continue
             val left = sideInset + i * slotW
             val right = left + slotW
 
-            // Highlight glass pill when pressed or active autocorrect candidate
             if (pressedSuggestionIndex == i || item.isAutoCorrectCandidate) {
                 keyPaint.color = theme.suggestionHighlightBg
-                reusableRect.set(left + dp(5f), barTop + dp(5f), right - dp(5f), barBottom - dp(5f))
-                canvas.drawRoundRect(reusableRect, pillRadius, pillRadius, keyPaint)
+                reusableRect.set(left + dp(4f), barTop + pillPadV, right - dp(4f), barBottom - pillPadV + dp(1f))
+                canvas.drawRoundRect(reusableRect, pillR, pillR, keyPaint)
 
                 if (theme.isGlassStyle && (theme.suggestionHighlightBorder ushr 24) > 0) {
+                    keyBorderPaint.shader = null
                     keyBorderPaint.color = theme.suggestionHighlightBorder
-                    keyBorderPaint.strokeWidth = dp(0.7f)
-                    canvas.drawRoundRect(reusableRect, pillRadius, pillRadius, keyBorderPaint)
+                    keyBorderPaint.strokeWidth = dp(0.75f)
+                    canvas.drawRoundRect(reusableRect, pillR, pillR, keyBorderPaint)
                 }
             }
 
             suggestionPaint.color = theme.suggestionText
             val label = if (item.isLiteral) "\u201C${item.text}\u201D" else item.text
-            val maxChars = ((slotW - dp(16f)) / suggestionPaint.measureText("m")).toInt().coerceAtLeast(6)
+            val maxChars = ((slotW - dp(14f)) / suggestionPaint.measureText("m")).toInt().coerceAtLeast(6)
             val ellipsized = if (label.length > maxChars + 2) label.take(maxChars) + "…" else label
             canvas.drawText(ellipsized, (left + right) * 0.5f, textCenterY, suggestionPaint)
         }
@@ -530,102 +686,126 @@ class IOSKeyboardView(context: Context) : View(context) {
         val spec = key.spec
         val isShiftActive = spec.code == KeyCode.SHIFT && shiftState != ShiftState.OFF
         val isBlueReturn = spec.code == KeyCode.RETURN && returnAction.isBlueAccent
+        val isCharOrSpace = spec.type == KeyType.CHARACTER || spec.type == KeyType.SPACE
 
-        val shadowColor: Int
-        val faceColor: Int
-        val topSheenColor: Int
-        val borderColor: Int
-
-        when {
-            isBlueReturn -> {
-                shadowColor = theme.keyActionBlueShadow
-                faceColor = if (isPressed) theme.keyActionBlueBgPressed else theme.keyActionBlueBg
-                topSheenColor = theme.keyActionBlueBgTop
-                borderColor = theme.keyActionBlueBorder
-            }
-            isShiftActive -> {
-                shadowColor = theme.keyCharShadow
-                faceColor = theme.keyShiftActiveBg
-                topSheenColor = theme.keyCharBgTop
-                borderColor = theme.keyCharBorder
-            }
-            spec.type == KeyType.CHARACTER || spec.type == KeyType.SPACE -> {
-                shadowColor = theme.keyCharShadow
-                faceColor = if (isPressed) theme.keyCharBgPressed else theme.keyCharBg
-                topSheenColor = theme.keyCharBgTop
-                borderColor = theme.keyCharBorder
-            }
-            else -> {
-                shadowColor = theme.keySpecialShadow
-                faceColor = if (isPressed) theme.keySpecialBgPressed else theme.keySpecialBg
-                topSheenColor = theme.keySpecialBgTop
-                borderColor = theme.keySpecialBorder
-            }
+        val shadowColor: Int = when {
+            isBlueReturn -> theme.keyActionBlueShadow
+            isShiftActive || isCharOrSpace -> theme.keyCharShadow
+            else -> theme.keySpecialShadow
         }
 
-        // Trackpad mode fades keycaps out smoothly
         val alphaScale = if (isTrackpadActive) theme.trackpadKeyAlpha / 255f else 1f
 
-        // 1. Keycap drop shadow (subtle soft optical depth in Liquid Glass, crisp 1dp in Classic)
+        // 1. Soft optical drop shadow underneath each keycap
         shadowPaint.color = shadowColor
         if (isTrackpadActive) {
             shadowPaint.alpha = ((shadowColor ushr 24) * alphaScale).toInt()
         }
-        reusableRect.set(r.left, r.top + shadowOffsetY, r.right, r.bottom + shadowOffsetY)
+        val shadowExpandX = if (theme.isGlassStyle) dp(0.35f) else 0f
+        reusableRect.set(
+            r.left - shadowExpandX,
+            r.top + shadowOffsetY,
+            r.right + shadowExpandX,
+            r.bottom + shadowOffsetY
+        )
         canvas.drawRoundRect(reusableRect, cornerR, cornerR, shadowPaint)
 
-        // 2. Main keycap surface
-        keyPaint.color = faceColor
-        if (isTrackpadActive) {
-            keyPaint.alpha = ((faceColor ushr 24) * alphaScale).toInt()
-        }
+        // 2. Main Keycap Body (true 3-stop GPU glass gradient for Liquid Glass & Frosted Blur!)
         reusableRect.set(r.left, r.top, r.right, r.bottom)
-        canvas.drawRoundRect(reusableRect, cornerR, cornerR, keyPaint)
+        val faceSolidFallback: Int
+        if (theme.isTranslucentStyle && !isPressed && !isShiftActive) {
+            val activeShader = when {
+                isBlueReturn -> blueActionShader
+                isCharOrSpace -> charKeyShader
+                else -> specialKeyShader
+            }
+            faceSolidFallback = when {
+                isBlueReturn -> theme.keyActionBlueBottom
+                isCharOrSpace -> theme.keyCharMid
+                else -> theme.keySpecialMid
+            }
+            if (activeShader != null) {
+                shaderMatrix.setTranslate(0f, r.top)
+                activeShader.setLocalMatrix(shaderMatrix)
+                keyGradientPaint.shader = activeShader
+                keyGradientPaint.alpha = if (isTrackpadActive) theme.trackpadKeyAlpha else 255
+                canvas.drawRoundRect(reusableRect, cornerR, cornerR, keyGradientPaint)
+            } else {
+                keyPaint.color = faceSolidFallback
+                keyPaint.alpha = if (isTrackpadActive) theme.trackpadKeyAlpha else 255
+                canvas.drawRoundRect(reusableRect, cornerR, cornerR, keyPaint)
+            }
+        } else {
+            faceSolidFallback = when {
+                isBlueReturn -> if (isPressed) theme.keyActionBluePressed else theme.keyActionBlueBottom
+                isShiftActive -> theme.keyShiftActiveBg
+                isCharOrSpace -> if (isPressed) theme.keyCharBgPressed else theme.keyCharMid
+                else -> if (isPressed) theme.keySpecialBgPressed else theme.keySpecialMid
+            }
+            keyPaint.color = faceSolidFallback
+            if (isTrackpadActive) {
+                keyPaint.alpha = ((faceSolidFallback ushr 24) * alphaScale).toInt()
+            }
+            canvas.drawRoundRect(reusableRect, cornerR, cornerR, keyPaint)
+        }
 
-        // 3. Liquid Glass optical refraction highlight & specular edge rim
+        // 3. Liquid Glass Fresnel Rim + Crisp Specular Top Edge Highlight (gives genuine 3D glass thickness!)
         if (theme.isGlassStyle && !isTrackpadActive) {
-            // Subtle glossy top-half glass sheen
-            if (!isPressed && (topSheenColor ushr 24) > 0) {
-                keySheenPaint.color = topSheenColor
-                keySheenPaint.alpha = ((topSheenColor ushr 24) * 0.28f).toInt()
-                val sheenInset = dp(0.8f)
-                reusableRect2.set(
-                    r.left + sheenInset,
-                    r.top + sheenInset,
-                    r.right - sheenInset,
-                    r.top + r.height * 0.48f
-                )
-                canvas.drawRoundRect(reusableRect2, (cornerR - sheenInset).coerceAtLeast(2f), (cornerR - sheenInset).coerceAtLeast(2f), keySheenPaint)
-            }
+            val strokeW = dp(0.95f)
+            val halfS = strokeW * 0.5f
+            reusableRect2.set(r.left + halfS, r.top + halfS, r.right - halfS, r.bottom - halfS)
+            keyBorderPaint.strokeWidth = strokeW
 
-            // Luminous specular glass rim stroke around keycap
-            if ((borderColor ushr 24) > 0) {
-                keyBorderPaint.color = borderColor
-                keyBorderPaint.strokeWidth = dp(0.78f)
-                val halfStroke = dp(0.39f)
-                reusableRect2.set(
-                    r.left + halfStroke,
-                    r.top + halfStroke,
-                    r.right - halfStroke,
-                    r.bottom - halfStroke
-                )
-                canvas.drawRoundRect(reusableRect2, cornerR, cornerR, keyBorderPaint)
-            }
-
-            // Crisp specular light catch along top key edge
-            val topRimAlpha = (theme.keyCharTopRim ushr 24)
-            if (topRimAlpha > 0 && (spec.type == KeyType.CHARACTER || spec.type == KeyType.SPACE || isBlueReturn)) {
-                keyBorderPaint.color = if (isBlueReturn) theme.keyActionBlueBorder else theme.keyCharTopRim
-                keyBorderPaint.strokeWidth = dp(0.85f)
-                val lineInset = cornerR * 0.72f
-                val lineY = r.top + dp(0.55f)
-                if (r.right - lineInset > r.left + lineInset) {
-                    canvas.drawLine(r.left + lineInset, lineY, r.right - lineInset, lineY, keyBorderPaint)
+            when {
+                isBlueReturn -> {
+                    keyBorderPaint.shader = null
+                    keyBorderPaint.color = theme.keyActionBlueRimTop
+                    canvas.drawRoundRect(reusableRect2, cornerR, cornerR, keyBorderPaint)
+                }
+                isCharOrSpace || isShiftActive -> {
+                    val rimShader = charRimShader
+                    if (rimShader != null && !isPressed) {
+                        shaderMatrix.setTranslate(0f, r.top)
+                        rimShader.setLocalMatrix(shaderMatrix)
+                        keyBorderPaint.shader = rimShader
+                    } else {
+                        keyBorderPaint.shader = null
+                        keyBorderPaint.color = theme.keyCharRimTop
+                    }
+                    canvas.drawRoundRect(reusableRect2, cornerR, cornerR, keyBorderPaint)
+                }
+                else -> {
+                    val rimShader = specialRimShader
+                    if (rimShader != null && !isPressed) {
+                        shaderMatrix.setTranslate(0f, r.top)
+                        rimShader.setLocalMatrix(shaderMatrix)
+                        keyBorderPaint.shader = rimShader
+                    } else {
+                        keyBorderPaint.shader = null
+                        keyBorderPaint.color = theme.keySpecialRimTop
+                    }
+                    canvas.drawRoundRect(reusableRect2, cornerR, cornerR, keyBorderPaint)
                 }
             }
-        } else if (theme.isTranslucentStyle && !isTrackpadActive && (borderColor ushr 24) > 0) {
-            // Subtle frosted edge definition
-            keyBorderPaint.color = borderColor
+            keyBorderPaint.shader = null
+
+            // Extra crisp specular light catch along top glass bevel
+            val topCatchColor = when {
+                isBlueReturn -> theme.keyActionBlueRimTop
+                isCharOrSpace || isShiftActive -> theme.keyCharRimTop
+                else -> theme.keySpecialRimTop
+            }
+            if ((topCatchColor ushr 24) > 0) {
+                keyBorderPaint.color = topCatchColor
+                keyBorderPaint.strokeWidth = dp(0.9f)
+                val bevelInset = (cornerR * 0.65f).coerceAtMost(r.width * 0.35f)
+                val lineY = r.top + dp(0.8f)
+                canvas.drawLine(r.left + bevelInset, lineY, r.right - bevelInset, lineY, keyBorderPaint)
+            }
+        } else if (theme.isFrostedStyle && !isTrackpadActive) {
+            // Subtle satin frosted rim (distinct from glossy Liquid Glass)
+            keyBorderPaint.shader = null
+            keyBorderPaint.color = if (isCharOrSpace) theme.keyCharRimTop else theme.keySpecialRimTop
             keyBorderPaint.strokeWidth = dp(0.6f)
             reusableRect2.set(r.left + dp(0.3f), r.top + dp(0.3f), r.right - dp(0.3f), r.bottom - dp(0.3f))
             canvas.drawRoundRect(reusableRect2, cornerR, cornerR, keyBorderPaint)
@@ -659,7 +839,7 @@ class IOSKeyboardView(context: Context) : View(context) {
                     size = dp(21f),
                     isPressed = isPressed,
                     fgColor = theme.keySpecialText,
-                    bgColor = faceColor,
+                    bgColor = faceSolidFallback,
                     paint = iconPaint,
                     path = reusablePath
                 )
@@ -676,8 +856,6 @@ class IOSKeyboardView(context: Context) : View(context) {
                 )
             }
             KeyCode.RETURN -> {
-                // Latest iOS 26 uses the sleek return.left arrow icon for standard Return,
-                // and crisp action text for Search / Send / Go / Done / Next
                 if (returnAction == ReturnAction.RETURN) {
                     IOSVectorIcons.drawReturnArrowIcon(
                         canvas = canvas,
@@ -704,7 +882,7 @@ class IOSKeyboardView(context: Context) : View(context) {
                 }
                 specialTextPaint.textSize = sp(15f)
                 specialTextPaint.color = theme.keyCharText
-                specialTextPaint.alpha = if (banner != null) 220 else 175
+                specialTextPaint.alpha = if (banner != null) 230 else 175
                 val baselineY = cy - (specialTextPaint.descent() + specialTextPaint.ascent()) * 0.5f
                 canvas.drawText(label, cx, baselineY, specialTextPaint)
                 specialTextPaint.alpha = 255
@@ -732,14 +910,14 @@ class IOSKeyboardView(context: Context) : View(context) {
         val chinCy = (chinTopPx + viewHeight) * 0.5f - dp(1f)
         val iconSize = dp(24f)
         val marginX = dp(34f)
-        val pillR = dp(18f)
+        val pillR = dp(18.5f)
 
-        // Left: Globe icon (tap to switch keyboard, long-press for picker)
+        // Left: Globe icon (tap to switch keyboard, hold for system picker)
         if (pressedChinAction == KeyCode.GLOBE) {
             keyPaint.color = theme.chinPressPillBg
             canvas.drawCircle(marginX, chinCy, pillR, keyPaint)
         }
-        iconPaint.alpha = if (pressedChinAction == KeyCode.GLOBE) 180 else 255
+        iconPaint.alpha = if (pressedChinAction == KeyCode.GLOBE) 190 else 255
         IOSVectorIcons.drawGlobeIcon(
             canvas = canvas,
             cx = marginX,
@@ -756,7 +934,7 @@ class IOSKeyboardView(context: Context) : View(context) {
             keyPaint.color = theme.chinPressPillBg
             canvas.drawCircle(viewWidth - marginX, chinCy, pillR, keyPaint)
         }
-        iconPaint.alpha = if (pressedChinAction == KeyCode.DISMISS) 180 else 255
+        iconPaint.alpha = if (pressedChinAction == KeyCode.DISMISS) 190 else 255
         IOSVectorIcons.drawKeyboardDismissIcon(
             canvas = canvas,
             cx = viewWidth - marginX,
@@ -773,7 +951,6 @@ class IOSKeyboardView(context: Context) : View(context) {
     private fun drawActivePopups(canvas: Canvas, viewWidth: Float) {
         if (isTrackpadActive) return
 
-        // Draw fading release popup first if active
         val fadeKey = fadingPopupKey
         if (fadeKey != null && popupEnabled) {
             val elapsed = SystemClock.uptimeMillis() - fadingPopupStartMs
@@ -786,7 +963,6 @@ class IOSKeyboardView(context: Context) : View(context) {
             }
         }
 
-        // Draw active pressed key popup or long-press alternates strip
         for (i in activePointers.indices) {
             val session = activePointers[i]
             if (!session.key.spec.isPopupEligible) continue
@@ -800,9 +976,6 @@ class IOSKeyboardView(context: Context) : View(context) {
         }
     }
 
-    /**
-     * Draws the signature connected iOS teardrop key magnifier balloon using smooth cubic Béziers.
-     */
     private fun drawTeardropPopup(
         canvas: Canvas,
         key: ComputedKey,
@@ -814,7 +987,7 @@ class IOSKeyboardView(context: Context) : View(context) {
         val headWidth = (kr.width * 1.60f).coerceAtLeast(dp(50f))
         val headHeight = dp(54f)
         val stemNeckH = dp(10.5f)
-        val rHead = if (theme.isGlassStyle) dp(13f) else dp(10f)
+        val rHead = if (theme.isGlassStyle) dp(14f) else dp(10f)
         val rBase = dp(theme.keyCornerRadiusDp)
 
         var headLeft = kr.centerX - headWidth * 0.5f
@@ -856,24 +1029,35 @@ class IOSKeyboardView(context: Context) : View(context) {
         reusablePath.close()
 
         // Soft drop shadow
+        popupFillPaint.shader = null
         popupFillPaint.color = theme.popupShadow
         popupFillPaint.alpha = ((theme.popupShadow ushr 24) * alpha) / 255
         canvas.save()
-        canvas.translate(0f, dp(2.5f))
+        canvas.translate(0f, dp(3f))
         canvas.drawPath(reusablePath, popupFillPaint)
         canvas.restore()
 
-        // Main popup body
-        popupFillPaint.color = theme.popupBg
-        popupFillPaint.alpha = ((theme.popupBg ushr 24) * alpha) / 255
+        // Optical glass popup fill
+        val pShader = popupShader
+        if (pShader != null && theme.isTranslucentStyle) {
+            shaderMatrix.setTranslate(0f, headTop)
+            pShader.setLocalMatrix(shaderMatrix)
+            popupFillPaint.shader = pShader
+            popupFillPaint.alpha = alpha
+        } else {
+            popupFillPaint.shader = null
+            popupFillPaint.color = theme.popupBgTop
+            popupFillPaint.alpha = alpha
+        }
         canvas.drawPath(reusablePath, popupFillPaint)
+        popupFillPaint.shader = null
 
-        // Crisp luminous outline
+        // Crisp glass outline
         popupStrokePaint.color = theme.popupBorder
         popupStrokePaint.alpha = ((theme.popupBorder ushr 24) * alpha) / 255
         canvas.drawPath(reusablePath, popupStrokePaint)
 
-        // Magnified character centered in head
+        // Magnified character
         popupTextPaint.color = theme.popupText
         popupTextPaint.alpha = alpha
         popupTextPaint.textSize = sp(33f)
@@ -881,9 +1065,6 @@ class IOSKeyboardView(context: Context) : View(context) {
         canvas.drawText(label, (headLeft + headRight) * 0.5f, textCenterY, popupTextPaint)
     }
 
-    /**
-     * Draws the iOS long-press accent / diacritic horizontal glass pill tray with blue active pill.
-     */
     private fun drawAlternatesStrip(canvas: Canvas, session: PointerSession, viewWidth: Float) {
         val kr = session.key.drawRect
         val alts = session.alternates
@@ -896,19 +1077,30 @@ class IOSKeyboardView(context: Context) : View(context) {
         val stripTop = (stripBottom - stripH).coerceAtLeast(dp(2f))
         val stripLeft = (kr.centerX - stripW * 0.5f).coerceIn(dp(4f), (viewWidth - stripW - dp(4f)).coerceAtLeast(dp(4f)))
         val stripRight = stripLeft + stripW
-        val stripRadius = if (theme.isGlassStyle) dp(14f) else dp(10f)
+        val stripRadius = if (theme.isGlassStyle) dp(15f) else dp(10f)
 
         // Soft shadow
+        popupFillPaint.shader = null
         popupFillPaint.color = theme.popupShadow
         popupFillPaint.alpha = theme.popupShadow ushr 24
         reusableRect.set(stripLeft, stripTop + dp(3f), stripRight, stripBottom + dp(3f))
         canvas.drawRoundRect(reusableRect, stripRadius, stripRadius, popupFillPaint)
 
-        // Tray background
-        popupFillPaint.color = theme.popupBg
-        popupFillPaint.alpha = theme.popupBg ushr 24
+        // Glass tray body
         reusableRect.set(stripLeft, stripTop, stripRight, stripBottom)
+        val pShader = popupShader
+        if (pShader != null && theme.isTranslucentStyle) {
+            shaderMatrix.setTranslate(0f, stripTop)
+            pShader.setLocalMatrix(shaderMatrix)
+            popupFillPaint.shader = pShader
+            popupFillPaint.alpha = 255
+        } else {
+            popupFillPaint.shader = null
+            popupFillPaint.color = theme.popupBgTop
+            popupFillPaint.alpha = 255
+        }
         canvas.drawRoundRect(reusableRect, stripRadius, stripRadius, popupFillPaint)
+        popupFillPaint.shader = null
 
         popupStrokePaint.color = theme.popupBorder
         popupStrokePaint.alpha = theme.popupBorder ushr 24
@@ -916,7 +1108,7 @@ class IOSKeyboardView(context: Context) : View(context) {
 
         popupTextPaint.textSize = sp(22f)
         val baselineY = (stripTop + stripBottom) * 0.5f - (popupTextPaint.descent() + popupTextPaint.ascent()) * 0.5f
-        val pillR = if (theme.isGlassStyle) dp(9f) else dp(7f)
+        val pillR = if (theme.isGlassStyle) dp(10f) else dp(7f)
 
         for (i in alts.indices) {
             val cellLeft = stripLeft + padH + i * actualCellW
@@ -944,9 +1136,7 @@ class IOSKeyboardView(context: Context) : View(context) {
 
         when (actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
-                val x = event.getX(actionIndex)
-                val y = event.getY(actionIndex)
-                handlePointerDown(pointerId, x, y)
+                handlePointerDown(pointerId, event.getX(actionIndex), event.getY(actionIndex))
             }
             MotionEvent.ACTION_MOVE -> {
                 for (idx in 0 until event.pointerCount) {
@@ -968,9 +1158,9 @@ class IOSKeyboardView(context: Context) : View(context) {
     private fun handlePointerDown(pointerId: Int, x: Float, y: Float) {
         if (isTrackpadActive) return
 
-        // 1. Check QuickType Suggestion Bar hit (pointer-isolated so multi-touch never interferes)
+        // 1. QuickType Suggestion Bar hit
         if (suggestionBarEnabled && y <= suggestionBarBottomPx + dp(2f)) {
-            val sideInset = if (theme.isGlassStyle) dp(10f) else dp(4f)
+            val sideInset = if (theme.isGlassStyle) dp(13f) else dp(4f)
             val usableW = (width - sideInset * 2f).coerceAtLeast(1f)
             val slot = ((x - sideInset) / (usableW / 3f)).toInt().coerceIn(0, 2)
             if (slot < suggestions.size) {
@@ -981,7 +1171,7 @@ class IOSKeyboardView(context: Context) : View(context) {
             return
         }
 
-        // 2. Check optional Bottom Chin (Globe left, Dismiss right — center dead-zone prevents accidental triggers)
+        // 2. Bottom Chin (Globe left, Dismiss right)
         if (bottomChinEnabled && y >= chinTopPx - dp(2f)) {
             val action = when {
                 x <= width * 0.38f -> KeyCode.GLOBE
@@ -1004,8 +1194,7 @@ class IOSKeyboardView(context: Context) : View(context) {
 
         val hitKey = layoutEngine.findKeyAt(computedKeys, x, y) ?: return
 
-        // 3. Multi-touch Rollover: if user starts pressing a new character while another character key is still down,
-        // immediately commit the earlier character so fast 2-thumb typing never drops a letter!
+        // 3. Multi-touch Rollover: immediately commit earlier character when next key touches down
         if (hitKey.spec.type == KeyType.CHARACTER && activePointers.isNotEmpty()) {
             val iter = activePointers.iterator()
             while (iter.hasNext()) {
@@ -1029,7 +1218,6 @@ class IOSKeyboardView(context: Context) : View(context) {
         activePointers.add(session)
         fadingPopupKey = null
 
-        // Instant tactile & audio feedback on touch down
         callback?.onKeyPressFeedback(hitKey.spec.code, hitKey.spec.type)
 
         when (hitKey.spec.code) {
@@ -1059,7 +1247,6 @@ class IOSKeyboardView(context: Context) : View(context) {
     }
 
     private fun handlePointerMove(pointerId: Int, x: Float, y: Float) {
-        // Cancel globe long-press if finger slides away from chin
         if (pointerId == chinPointerId && pressedChinAction != 0) {
             if (y < chinTopPx - dp(18f)) {
                 mainHandler.removeCallbacks(globeLongPressRunnable)
@@ -1070,7 +1257,6 @@ class IOSKeyboardView(context: Context) : View(context) {
             return
         }
 
-        // Spacebar trackpad cursor glide
         if (isTrackpadActive && pointerId == trackpadPointerId) {
             val dx = x - trackpadLastStepX
             trackpadLastStepX = x
@@ -1086,7 +1272,6 @@ class IOSKeyboardView(context: Context) : View(context) {
 
         val session = activePointers.firstOrNull { it.pointerId == pointerId } ?: return
 
-        // Long-press alternates slide selection
         if (session.isLongPressAlternates && session.alternates.isNotEmpty()) {
             val alts = session.alternates
             val cellW = dp(38f)
@@ -1104,7 +1289,6 @@ class IOSKeyboardView(context: Context) : View(context) {
             return
         }
 
-        // Swipe-left from Backspace deletes whole word
         if (session.key.spec.code == KeyCode.BACKSPACE && !session.didSwipeDeleteWord) {
             if (session.downX - x > dp(38f)) {
                 session.didSwipeDeleteWord = true
@@ -1115,7 +1299,6 @@ class IOSKeyboardView(context: Context) : View(context) {
             return
         }
 
-        // Cancel spacebar trackpad timer if finger moves noticeably off spacebar
         if (session.key.spec.code == KeyCode.SPACE) {
             if (abs(x - session.downX) > dp(16f) || abs(y - session.downY) > dp(20f)) {
                 mainHandler.removeCallbacks(spaceTrackpadRunnable)
@@ -1123,7 +1306,6 @@ class IOSKeyboardView(context: Context) : View(context) {
             return
         }
 
-        // Smooth finger slide between character keys before release (authentic iOS slide-to-correct)
         if (session.key.spec.type == KeyType.CHARACTER) {
             val newKey = layoutEngine.findKeyAt(computedKeys, x, y)
             if (newKey != null && newKey.spec.type == KeyType.CHARACTER && newKey.spec.id != session.key.spec.id) {
@@ -1138,7 +1320,6 @@ class IOSKeyboardView(context: Context) : View(context) {
     }
 
     private fun handlePointerUp(pointerId: Int, x: Float, y: Float) {
-        // Suggestion bar tap release (matched strictly by pointerId)
         if (pointerId == suggestionPointerId && pressedSuggestionIndex >= 0) {
             val idx = pressedSuggestionIndex
             pressedSuggestionIndex = -1
@@ -1153,7 +1334,6 @@ class IOSKeyboardView(context: Context) : View(context) {
             return
         }
 
-        // Bottom chin tap release (matched strictly by pointerId)
         if (pointerId == chinPointerId) {
             mainHandler.removeCallbacks(globeLongPressRunnable)
             val action = pressedChinAction
@@ -1168,7 +1348,6 @@ class IOSKeyboardView(context: Context) : View(context) {
             return
         }
 
-        // Exit spacebar trackpad mode
         if (isTrackpadActive && pointerId == trackpadPointerId) {
             isTrackpadActive = false
             trackpadPointerId = MotionEvent.INVALID_POINTER_ID
@@ -1178,7 +1357,6 @@ class IOSKeyboardView(context: Context) : View(context) {
             return
         }
 
-        // Stop backspace repeat
         if (pointerId == backspacePointerId) {
             backspacePointerId = MotionEvent.INVALID_POINTER_ID
             mainHandler.removeCallbacks(backspaceRepeatRunnable)
@@ -1203,7 +1381,7 @@ class IOSKeyboardView(context: Context) : View(context) {
                 KeyCode.SPACE, KeyCode.RETURN -> {
                     callback?.onSpecialKey(session.key.spec.code)
                 }
-                else -> Unit // Modifiers & Backspace already fired on touch-down
+                else -> Unit
             }
         }
 
@@ -1262,14 +1440,14 @@ class IOSKeyboardView(context: Context) : View(context) {
 
     companion object {
         private const val GLASS_TOP_INSET_DP = 5f
-        private const val SUGGESTION_BAR_DP = 42f
+        private const val SUGGESTION_BAR_DP = 44f
         private const val TOP_NO_BAR_PAD_DP = 8f
         private const val KEYS_TOP_PAD_DP = 5f
         private const val KEYS_BOTTOM_PAD_DP = 6f
         private const val ROW_GAP_DP = 10.5f
         private const val BOTTOM_CHIN_DP = 42f
 
-        private const val POPUP_FADE_DURATION_MS = 70L
+        private const val POPUP_FADE_DURATION_MS = 65L
         private const val LONG_PRESS_ALTERNATES_MS = 360L
         private const val GLOBE_LONG_PRESS_MS = 380L
         private const val SPACE_TRACKPAD_DELAY_MS = 310L

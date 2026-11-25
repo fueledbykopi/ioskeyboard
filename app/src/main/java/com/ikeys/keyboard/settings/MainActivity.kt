@@ -118,11 +118,31 @@ class MainActivity : Activity() {
         setupCard.addView(step2Row)
         root.addView(setupCard)
 
-        // 2. Live Sandbox Typing Field
+        // 2. Live Sandbox Typing Field with vibrant iOS wallpaper card so Liquid Glass & Frosted Blur shine visibly
         root.addView(sectionHeader("LIVE TEST SANDBOX"))
-        val sandboxCard = createCard()
+        val sandboxCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                if (isNightUi) {
+                    intArrayOf(0xFF1A2540.toInt(), 0xFF2B1D3D.toInt(), 0xFF152A38.toInt())
+                } else {
+                    intArrayOf(0xFFE3F0FF.toInt(), 0xFFF3E8FF.toInt(), 0xFFE2F7F0.toInt())
+                }
+            ).apply {
+                cornerRadius = dp(14).toFloat()
+            }
+            setPadding(dp(2), dp(2), dp(2), dp(2))
+        }
+        val sandboxInner = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                setColor(if (isNightUi) 0xCC161822.toInt() else 0xD9FFFFFF.toInt())
+                cornerRadius = dp(12).toFloat()
+            }
+        }
         val sandboxInput = EditText(this).apply {
-            hint = "Tap here to test Liquid Glass, Frosted Blur, QuickType predictions & Globe switcher…"
+            hint = "Tap here to test Liquid Glass, Frosted Blur, instant typing, QuickType & Globe…"
             setHintTextColor(secondaryText)
             setTextColor(primaryText)
             textSize = 16f
@@ -135,7 +155,8 @@ class MainActivity : Activity() {
             gravity = Gravity.TOP or Gravity.START
             setPadding(dp(14), dp(12), dp(14), dp(12))
         }
-        sandboxCard.addView(sandboxInput)
+        sandboxInner.addView(sandboxInput)
+        sandboxCard.addView(sandboxInner)
         root.addView(sandboxCard)
 
         // 3. Appearance & Material

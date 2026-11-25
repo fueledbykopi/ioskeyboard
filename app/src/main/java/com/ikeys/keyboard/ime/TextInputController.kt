@@ -171,6 +171,42 @@ class TextInputController {
     }
 
     /**
+     * Extracts the two completed words immediately before the cursor (prev2, prev1) for trigram prediction.
+     */
+    fun extractPreviousTwoWords(textBeforeCursor: CharSequence?): Pair<String, String> {
+        if (textBeforeCursor.isNullOrEmpty()) return "" to ""
+        var i = textBeforeCursor.length - 1
+        while (i >= 0 && (textBeforeCursor[i].isLetter() || textBeforeCursor[i] == '\'')) {
+            i--
+        }
+        var sawSpace = false
+        while (i >= 0 && textBeforeCursor[i] == ' ') {
+            sawSpace = true
+            i--
+        }
+        if (!sawSpace || i < 0) return "" to ""
+        val end1 = i + 1
+        while (i >= 0 && (textBeforeCursor[i].isLetter() || textBeforeCursor[i] == '\'')) {
+            i--
+        }
+        val prev1 = textBeforeCursor.substring(i + 1, end1)
+        if (prev1.isEmpty()) return "" to ""
+
+        var sawSpace2 = false
+        while (i >= 0 && textBeforeCursor[i] == ' ') {
+            sawSpace2 = true
+            i--
+        }
+        if (!sawSpace2 || i < 0) return "" to prev1
+        val end2 = i + 1
+        while (i >= 0 && (textBeforeCursor[i].isLetter() || textBeforeCursor[i] == '\'')) {
+            i--
+        }
+        val prev2 = textBeforeCursor.substring(i + 1, end2)
+        return prev2 to prev1
+    }
+
+    /**
      * Returns true if the cursor is at the start of text, after newline, or after sentence-ending punctuation + space.
      */
     fun shouldAutoCapitalize(textBeforeCursor: CharSequence?): Boolean {

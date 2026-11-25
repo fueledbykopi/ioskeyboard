@@ -4,6 +4,7 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.SoundPool
+import android.os.SystemClock
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
@@ -38,9 +39,17 @@ class IOSSoundEngine(context: Context) {
 
     @Volatile var enabled: Boolean = true
     @Volatile var volume: Float = 0.78f
+    @Volatile private var cachedRingerMode: Int = AudioManager.RINGER_MODE_NORMAL
+    @Volatile private var lastRingerCheckMs: Long = 0L
 
     init {
+        refreshRingerMode()
         initAsync()
+    }
+
+    fun refreshRingerMode() {
+        cachedRingerMode = audioManager?.ringerMode ?: AudioManager.RINGER_MODE_NORMAL
+        lastRingerCheckMs = SystemClock.uptimeMillis()
     }
 
     private fun initAsync() {
@@ -90,8 +99,12 @@ class IOSSoundEngine(context: Context) {
     fun play(type: SoundType) {
         if (!enabled || isReleased) return
         val pool = soundPool ?: return
-        val ringerMode = audioManager?.ringerMode ?: AudioManager.RINGER_MODE_NORMAL
-        if (ringerMode != AudioManager.RINGER_MODE_NORMAL) return
+        val now = SystemClock.uptimeMillis()
+        if (now - lastRingerCheckMs > 1500L) {
+            cachedRingerMode = audioManager?.ringerMode ?: AudioManager.RINGER_MODE_NORMAL
+            lastRingerCheckMs = now
+        }
+        if (cachedRingerMode != AudioManager.RINGER_MODE_NORMAL) return
 
         val soundId = when (type) {
             SoundType.KEY_CLICK -> keySoundId

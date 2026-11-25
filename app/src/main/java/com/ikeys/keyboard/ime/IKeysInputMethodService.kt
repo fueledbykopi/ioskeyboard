@@ -8,12 +8,15 @@ import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.inputmethodservice.InputMethodService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.text.InputType
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.WindowInsetsController
+import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
@@ -32,14 +35,19 @@ import com.ikeys.keyboard.prefs.IKeysPreferences
 import com.ikeys.keyboard.ui.IOSEmojiPanelView
 import com.ikeys.keyboard.ui.IOSKeyboardTheme
 import com.ikeys.keyboard.ui.IOSKeyboardView
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import java.util.function.Consumer
 
 /**
  * Core Android InputMethodService for iKeys.
- * Engineered for:
- * - Instant zero-lag Liquid Glass & Frosted Blur (with real Android 12+ cross-window blur + graceful fallback)
- * - Reliable composing-text QuickType predictions & contextual next-word bigrams
- * - 100% reliable Globe keyboard switching (tap = next keyboard, long-press = system picker)
+ *
+ * Ultra-low-latency architecture:
+ * - ZERO synchronous Binder IPC (getTextBeforeCursor/getSelectedText) on the hot typing path!
+ *   Characters hit the screen immediately on frame 0 via local shadow context + setComposingText.
+ * - Background suggestion worker with monotonic sequence counter so QuickType never stalls typing.
+ * - Real Android 12+ cross-window blur (clearing opaque system inputArea backgrounds) + rich Liquid Glass / Frosted Blur.
+ * - 100% reliable Globe switcher (tap = next keyboard, long-press = system picker).
  */
 class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, IOSEmojiPanelView.Callback {
 
@@ -48,6 +56,10 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
     private lateinit var hapticEngine: IOSHapticEngine
     private val suggestionEngine = SuggestionEngine()
     private val inputController = TextInputController()
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val suggestionExecutor = Executors.newSingleThreadExecutor()
+    private val suggestionSeq = AtomicLong(0L)
 
     private var rootContainer: FrameLayout? = null
     private var keyboardView: IOSKeyboardView? = null
@@ -60,10 +72,13 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
     private var fieldSupportsAutoCorrect: Boolean = true
     private var activeImeActionId: Int = EditorInfo.IME_ACTION_NONE
 
-    // Local composing state so QuickType predictions never lag behind async Binder IPC
+    // Local zero-IPC typing shadow state (eliminates synchronous getTextBeforeCursor stalls!)
     private val composingWord = StringBuilder(32)
+    private val localTail = StringBuilder(64)
     private var lastCompletedWord: String = ""
-    private var lastComposingEditMs: Long = 0L
+    private var prevCompletedWord: String = ""
+    private var hasActiveSelection: Boolean = false
+    private var lastLocalEditMs: Long = 0L
     private var learnedWordsDirtyCount: Int = 0
 
     // Real-time Android 12+ cross-window blur tracking
@@ -87,7 +102,10 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
         prefs = IKeysPreferences(this)
         soundEngine = IOSSoundEngine(this)
         hapticEngine = IOSHapticEngine(this)
-        suggestionEngine.loadUserWordsCsv(prefs.learnedWordsCsv)
+        val savedCsv = prefs.learnedWordsCsv
+        if (savedCsv.isNotBlank()) {
+            suggestionExecutor.execute { suggestionEngine.loadUserWordsCsv(savedCsv) }
+        }
         syncSubtypeLanguage(getCurrentSubtypeSafely(), showBanner = false)
         prefs.registerListener(prefListener)
         syncPreferencesToEnginesAndUi()
@@ -130,12 +148,14 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
         registerBlurListenerIfSupported()
         syncPreferencesToEnginesAndUi()
         pushKeyboardState()
-        refreshSuggestions()
+        refreshSuggestionsAsync()
         return container
     }
 
     override fun onWindowShown() {
         super.onWindowShown()
+        soundEngine.refreshRingerMode()
+        clearOpaqueSystemInputParents()
         registerBlurListenerIfSupported()
         syncPreferencesToEnginesAndUi()
     }
@@ -143,13 +163,13 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
         inspectEditorInfo(info)
+        clearOpaqueSystemInputParents()
         composingWord.setLength(0)
+        hasActiveSelection = false
 
-        val textBefore = currentInputConnection?.getTextBeforeCursor(80, 0)
-        lastCompletedWord = inputController.extractPreviousWord(textBefore)
-        if (lastCompletedWord.isEmpty() && !textBefore.isNullOrEmpty() && textBefore.endsWith(" ")) {
-            lastCompletedWord = inputController.extractCurrentWord(textBefore.trimEnd())
-        }
+        val textBefore = currentInputConnection?.getTextBeforeCursor(64, 0)
+        resetLocalTailFrom(textBefore)
+        syncPreviousWordsFrom(textBefore)
 
         inputController.resetForNewInput(
             textBeforeCursor = textBefore,
@@ -159,7 +179,7 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
         syncPreferencesToEnginesAndUi()
         showEmojiPanel(false)
         pushKeyboardState()
-        refreshSuggestions(textBeforeOverride = textBefore)
+        refreshSuggestionsAsync()
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
@@ -177,7 +197,7 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
     override fun onCurrentInputMethodSubtypeChanged(newSubtype: InputMethodSubtype?) {
         super.onCurrentInputMethodSubtypeChanged(newSubtype)
         syncSubtypeLanguage(newSubtype, showBanner = true)
-        refreshSuggestions()
+        refreshSuggestionsAsync()
     }
 
     override fun onUpdateSelection(
@@ -190,35 +210,37 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
     ) {
         super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
 
+        hasActiveSelection = newSelStart != newSelEnd
         val now = SystemClock.uptimeMillis()
-        val hasSelectionRange = newSelStart != newSelEnd
-        val textBefore = currentInputConnection?.getTextBeforeCursor(80, 0)
 
-        // Reset composing buffer only if user externally moved cursor or selected text
+        // Fast-path: ignore delayed selection echoes triggered by our own recent keystrokes!
+        // This eliminates redundant cross-process getTextBeforeCursor() Binder stalls during typing.
+        if (!hasActiveSelection && now - lastLocalEditMs < 350L) {
+            return
+        }
+
+        val textBefore = currentInputConnection?.getTextBeforeCursor(64, 0)
         if (composingWord.isNotEmpty()) {
-            if (hasSelectionRange) {
+            if (hasActiveSelection || (textBefore != null && !textBefore.endsWith(composingWord.toString()))) {
                 composingWord.setLength(0)
                 currentInputConnection?.finishComposingText()
-            } else if (now - lastComposingEditMs > 220L) {
-                val active = composingWord.toString()
-                if (textBefore != null && !textBefore.endsWith(active)) {
-                    composingWord.setLength(0)
-                    currentInputConnection?.finishComposingText()
-                }
             }
         }
 
-        if (composingWord.isEmpty() && textBefore != null) {
-            lastCompletedWord = inputController.extractPreviousWord(textBefore)
+        if (textBefore != null) {
+            resetLocalTailFrom(textBefore)
+            if (composingWord.isEmpty()) {
+                syncPreviousWordsFrom(textBefore)
+            }
         }
 
         inputController.updateAutoShift(
-            textBeforeCursor = textBefore,
+            textBeforeCursor = localTail,
             autoCapEnabled = prefs.autoCapitalize,
             fieldSupportsAutoCap = fieldSupportsAutoCap
         )
         pushKeyboardState()
-        refreshSuggestions(textBeforeOverride = textBefore)
+        refreshSuggestionsAsync()
     }
 
     override fun onDestroy() {
@@ -226,6 +248,7 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
         flushLearnedWordsIfNeeded(force = true)
         prefs.unregisterListener(prefListener)
         soundEngine.release()
+        suggestionExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -248,43 +271,33 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
         }
     }
 
+    /**
+     * Zero-delay character output: immediately dispatches text to InputConnection without
+     * blocking on synchronous getTextBeforeCursor IPC or main-thread suggestion computation.
+     */
     override fun onCharacter(text: String) {
         val ic = currentInputConnection ?: return
         val isWordChar = text.isNotEmpty() && text.all { it.isLetter() || it == '\'' }
+        lastLocalEditMs = SystemClock.uptimeMillis()
 
         if (fieldSupportsPredictions && prefs.predictionBarEnabled && isWordChar) {
-            if (composingWord.isEmpty()) {
-                val textBefore = ic.getTextBeforeCursor(64, 0)
-                val existingWord = inputController.extractCurrentWord(textBefore)
-                if (textBefore != null) {
-                    lastCompletedWord = inputController.extractPreviousWord(textBefore)
-                }
-                if (existingWord.isNotEmpty()) {
-                    ic.beginBatchEdit()
-                    ic.deleteSurroundingText(existingWord.length, 0)
-                    composingWord.append(existingWord).append(text)
-                    ic.setComposingText(composingWord.toString(), 1)
-                    ic.endBatchEdit()
-                } else {
-                    composingWord.append(text)
-                    ic.setComposingText(composingWord.toString(), 1)
-                }
-            } else {
-                composingWord.append(text)
-                ic.setComposingText(composingWord.toString(), 1)
-            }
-            lastComposingEditMs = SystemClock.uptimeMillis()
+            composingWord.append(text)
+            ic.setComposingText(composingWord.toString(), 1)
+            appendLocalTail(text)
         } else {
             commitComposingIfNeeded(ic)
             ic.commitText(text, 1)
+            appendLocalTail(text)
             if (text.any { it == '.' || it == '?' || it == '!' || it == '\n' }) {
+                prevCompletedWord = ""
                 lastCompletedWord = ""
             }
         }
 
+        hasActiveSelection = false
         inputController.onCharacterCommitted(text)
         pushKeyboardState()
-        refreshSuggestions()
+        refreshSuggestionsAsync()
     }
 
     override fun onSpecialKey(code: Int) {
@@ -306,8 +319,7 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
             KeyCode.ALPHA -> {
                 inputController.setMode(KeyboardMode.ALPHA)
                 showEmojiPanel(false)
-                val textBefore = currentInputConnection?.getTextBeforeCursor(80, 0)
-                inputController.updateAutoShift(textBefore, prefs.autoCapitalize, fieldSupportsAutoCap)
+                inputController.updateAutoShift(localTail, prefs.autoCapitalize, fieldSupportsAutoCap)
                 pushKeyboardState()
             }
             KeyCode.EMOJI -> {
@@ -331,17 +343,33 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
 
     override fun onBackspace(deleteWord: Boolean) {
         val ic = currentInputConnection ?: return
+        lastLocalEditMs = SystemClock.uptimeMillis()
 
-        // 1. If user has an active selection, delete the selected text cleanly
-        val selected = ic.getSelectedText(0)
-        if (!selected.isNullOrEmpty()) {
-            composingWord.setLength(0)
-            ic.commitText("", 1)
-        } else if (composingWord.isNotEmpty()) {
-            // 2. Fast local composing deletion (instant QuickType update, zero IPC lag)
+        // 1. Delete active text selection only when one is known to exist
+        if (hasActiveSelection) {
+            val selected = ic.getSelectedText(0)
+            if (!selected.isNullOrEmpty()) {
+                composingWord.setLength(0)
+                hasActiveSelection = false
+                ic.commitText("", 1)
+                val after = ic.getTextBeforeCursor(64, 0)
+                resetLocalTailFrom(after)
+                syncPreviousWordsFrom(after)
+                inputController.updateAutoShift(localTail, prefs.autoCapitalize, fieldSupportsAutoCap)
+                pushKeyboardState()
+                refreshSuggestionsAsync()
+                return
+            }
+            hasActiveSelection = false
+        }
+
+        // 2. Zero-IPC fast composing backspace!
+        if (composingWord.isNotEmpty()) {
             if (deleteWord) {
+                val len = composingWord.length
                 composingWord.setLength(0)
                 ic.commitText("", 1)
+                trimLocalTail(len)
             } else {
                 composingWord.deleteCharAt(composingWord.length - 1)
                 if (composingWord.isNotEmpty()) {
@@ -349,55 +377,60 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
                 } else {
                     ic.commitText("", 1)
                 }
+                trimLocalTail(1)
             }
-            lastComposingEditMs = SystemClock.uptimeMillis()
         } else {
-            // 3. Standard deletion before cursor (safe for surrogate pairs & ZWJ emojis)
-            val textBefore = ic.getTextBeforeCursor(64, 0)
+            // 3. Delete before cursor cleanly (surrogate-pair & ZWJ emoji safe)
+            val textBefore = if (localTail.isNotEmpty()) localTail else ic.getTextBeforeCursor(64, 0)
             val count = if (deleteWord) {
                 TextInputController.computeWordBackspaceCount(textBefore)
             } else {
                 TextInputController.computeSingleBackspaceCount(textBefore)
             }
             ic.deleteSurroundingText(count, 0)
+            trimLocalTail(count)
+            if (localTail.isEmpty()) {
+                val refreshed = ic.getTextBeforeCursor(64, 0)
+                resetLocalTailFrom(refreshed)
+            }
+            syncPreviousWordsFrom(localTail)
         }
 
-        val updatedBefore = ic.getTextBeforeCursor(80, 0)
-        if (composingWord.isEmpty()) {
-            lastCompletedWord = inputController.extractPreviousWord(updatedBefore)
-        }
-        inputController.updateAutoShift(updatedBefore, prefs.autoCapitalize, fieldSupportsAutoCap)
+        inputController.updateAutoShift(localTail, prefs.autoCapitalize, fieldSupportsAutoCap)
         pushKeyboardState()
-        refreshSuggestions(textBeforeOverride = updatedBefore)
+        refreshSuggestionsAsync()
     }
 
     override fun onSuggestionPicked(item: SuggestionItem) {
         val ic = currentInputConnection ?: return
         val picked = item.text
+        lastLocalEditMs = SystemClock.uptimeMillis()
+        hasActiveSelection = false
 
         ic.beginBatchEdit()
         if (composingWord.isNotEmpty()) {
-            // Atomically replaces the active composing span across all Android editors
+            val prevLen = composingWord.length
             ic.commitText("$picked ", 1)
             composingWord.setLength(0)
+            trimLocalTail(prevLen)
+            appendLocalTail("$picked ")
         } else {
-            val textBefore = ic.getTextBeforeCursor(64, 0)
-            val existingWord = inputController.extractCurrentWord(textBefore)
+            val existingWord = inputController.extractCurrentWord(localTail)
             if (existingWord.isNotEmpty()) {
                 ic.deleteSurroundingText(existingWord.length, 0)
+                trimLocalTail(existingWord.length)
             }
             ic.commitText("$picked ", 1)
+            appendLocalTail("$picked ")
         }
         ic.endBatchEdit()
 
-        lastComposingEditMs = SystemClock.uptimeMillis()
-        recordLearnedWordAndBigram(picked, boost = 30)
-        lastCompletedWord = picked
+        recordLearnedWordAndBigramAsync(picked, boost = 30)
+        advanceCompletedWords(picked)
 
-        val after = ic.getTextBeforeCursor(80, 0)
-        inputController.updateAutoShift(after, prefs.autoCapitalize, fieldSupportsAutoCap)
+        inputController.updateAutoShift(localTail, prefs.autoCapitalize, fieldSupportsAutoCap)
         pushKeyboardState()
-        refreshSuggestions(textBeforeOverride = after)
+        refreshSuggestionsAsync()
     }
 
     override fun onTrackpadStart() {
@@ -417,11 +450,12 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
     }
 
     override fun onTrackpadEnd() {
-        val textBefore = currentInputConnection?.getTextBeforeCursor(80, 0)
-        lastCompletedWord = inputController.extractPreviousWord(textBefore)
-        inputController.updateAutoShift(textBefore, prefs.autoCapitalize, fieldSupportsAutoCap)
+        val textBefore = currentInputConnection?.getTextBeforeCursor(64, 0)
+        resetLocalTailFrom(textBefore)
+        syncPreviousWordsFrom(textBefore)
+        inputController.updateAutoShift(localTail, prefs.autoCapitalize, fieldSupportsAutoCap)
         pushKeyboardState()
-        refreshSuggestions(textBeforeOverride = textBefore)
+        refreshSuggestionsAsync()
     }
 
     override fun onPopupSlideTick() {
@@ -433,7 +467,9 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
     override fun onEmojiSelected(emoji: String) {
         soundEngine.play(IOSSoundEngine.SoundType.KEY_CLICK)
         hapticEngine.keyTap()
+        lastLocalEditMs = SystemClock.uptimeMillis()
         currentInputConnection?.commitText(emoji, 1)
+        appendLocalTail(emoji)
     }
 
     override fun onBackspace() {
@@ -454,11 +490,13 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
 
     private fun handleSpaceKey() {
         val ic = currentInputConnection ?: return
-        val textBefore = ic.getTextBeforeCursor(64, 0)
+        lastLocalEditMs = SystemClock.uptimeMillis()
+        hasActiveSelection = false
+
         val activeWord = if (composingWord.isNotEmpty()) {
             composingWord.toString()
         } else {
-            inputController.extractCurrentWord(textBefore)
+            inputController.extractCurrentWord(localTail)
         }
 
         // High-confidence autocorrect on space (contractions, shorthands, clear 1-edit typos)
@@ -468,35 +506,35 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
                 ic.beginBatchEdit()
                 if (composingWord.isNotEmpty()) {
                     ic.commitText("$replacement ", 1)
+                    trimLocalTail(composingWord.length)
                     composingWord.setLength(0)
                 } else {
                     ic.deleteSurroundingText(activeWord.length, 0)
+                    trimLocalTail(activeWord.length)
                     ic.commitText("$replacement ", 1)
                 }
                 ic.endBatchEdit()
-                lastComposingEditMs = SystemClock.uptimeMillis()
-                recordLearnedWordAndBigram(replacement, boost = 15)
-                lastCompletedWord = replacement
+                appendLocalTail("$replacement ")
+                recordLearnedWordAndBigramAsync(replacement, boost = 15)
+                advanceCompletedWords(replacement)
                 postSpaceUpdate()
                 return
             }
         }
 
-        // Finalize composing word cleanly before inserting space
         if (composingWord.isNotEmpty()) {
             ic.finishComposingText()
             composingWord.setLength(0)
-            lastComposingEditMs = SystemClock.uptimeMillis()
         }
 
         if (activeWord.length >= 2) {
-            recordLearnedWordAndBigram(activeWord, boost = 10)
-            lastCompletedWord = activeWord
+            recordLearnedWordAndBigramAsync(activeWord, boost = 10)
+            advanceCompletedWords(activeWord)
         }
 
         val action = inputController.onSpaceTap(
-            nowMs = SystemClock.uptimeMillis(),
-            textBeforeCursor = textBefore,
+            nowMs = lastLocalEditMs,
+            textBeforeCursor = localTail,
             doubleSpacePeriodEnabled = prefs.doubleSpacePeriod
         )
 
@@ -505,23 +543,27 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
             ic.deleteSurroundingText(1, 0)
             ic.commitText(". ", 1)
             ic.endBatchEdit()
+            trimLocalTail(1)
+            appendLocalTail(". ")
+            prevCompletedWord = ""
             lastCompletedWord = ""
         } else {
             ic.commitText(" ", 1)
+            appendLocalTail(" ")
         }
 
         postSpaceUpdate()
     }
 
     private fun postSpaceUpdate() {
-        val updatedBefore = currentInputConnection?.getTextBeforeCursor(80, 0)
-        inputController.updateAutoShift(updatedBefore, prefs.autoCapitalize, fieldSupportsAutoCap)
+        inputController.updateAutoShift(localTail, prefs.autoCapitalize, fieldSupportsAutoCap)
         pushKeyboardState()
-        refreshSuggestions(textBeforeOverride = updatedBefore)
+        refreshSuggestionsAsync()
     }
 
     private fun handleReturnKey() {
         val ic = currentInputConnection ?: return
+        lastLocalEditMs = SystemClock.uptimeMillis()
         commitComposingIfNeeded(ic)
 
         val info = currentInputEditorInfo
@@ -531,21 +573,16 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
             ic.performEditorAction(activeImeActionId)
         } else {
             ic.commitText("\n", 1)
+            appendLocalTail("\n")
         }
 
+        prevCompletedWord = ""
         lastCompletedWord = ""
-        val updatedBefore = ic.getTextBeforeCursor(80, 0)
-        inputController.updateAutoShift(updatedBefore, prefs.autoCapitalize, fieldSupportsAutoCap)
+        inputController.updateAutoShift(localTail, prefs.autoCapitalize, fieldSupportsAutoCap)
         pushKeyboardState()
-        refreshSuggestions(textBeforeOverride = updatedBefore)
+        refreshSuggestionsAsync()
     }
 
-    /**
-     * Fixes Globe icon switching across all Android versions & OEMs:
-     * Directly switches to the next enabled third-party/system keyboard (instead of getting
-     * trapped ping-ponging between iKeys's own en_US / id_ID subtypes via MRU), and falls
-     * back seamlessly to Android's native Input Method Picker.
-     */
     private fun switchToNextKeyboardOrPicker() {
         commitComposingIfNeeded(currentInputConnection)
 
@@ -558,7 +595,6 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
 
         val otherImes = enabledImes.filter { it.packageName != packageName }
         if (otherImes.isNotEmpty()) {
-            // Find the IME immediately after ours in the enabled list (wrapping around)
             val myIndex = enabledImes.indexOfFirst { it.packageName == packageName }
             val nextIme = if (myIndex >= 0) {
                 var candidate = otherImes.first()
@@ -578,11 +614,9 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
                 switchInputMethod(nextIme.id)
                 return
             } catch (_: Throwable) {
-                // Fall through to picker if OEM restricts direct switchInputMethod
             }
         }
 
-        // If no other IME is enabled or direct switch failed, open the system keyboard picker
         showInputMethodPickerDialog()
     }
 
@@ -596,21 +630,29 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
             val word = composingWord.toString()
             ic?.finishComposingText()
             composingWord.setLength(0)
-            lastComposingEditMs = SystemClock.uptimeMillis()
+            lastLocalEditMs = SystemClock.uptimeMillis()
             if (word.length >= 2) {
-                recordLearnedWordAndBigram(word, boost = 10)
-                lastCompletedWord = word
+                recordLearnedWordAndBigramAsync(word, boost = 10)
+                advanceCompletedWords(word)
             }
         }
     }
 
-    private fun recordLearnedWordAndBigram(word: String, boost: Int) {
-        suggestionEngine.learnWord(word, boost = boost)
-        if (lastCompletedWord.isNotEmpty()) {
-            suggestionEngine.learnTransition(lastCompletedWord, word, boost = boost)
+    private fun advanceCompletedWords(word: String) {
+        prevCompletedWord = lastCompletedWord
+        lastCompletedWord = word
+    }
+
+    private fun recordLearnedWordAndBigramAsync(word: String, boost: Int) {
+        val prev = lastCompletedWord
+        suggestionExecutor.execute {
+            suggestionEngine.learnWord(word, boost = boost)
+            if (prev.isNotEmpty()) {
+                suggestionEngine.learnTransition(prev, word, boost = boost)
+            }
         }
         learnedWordsDirtyCount++
-        if (learnedWordsDirtyCount >= 5) {
+        if (learnedWordsDirtyCount >= 6) {
             flushLearnedWordsIfNeeded(force = false)
         }
     }
@@ -618,9 +660,41 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
     private fun flushLearnedWordsIfNeeded(force: Boolean) {
         if (learnedWordsDirtyCount == 0 && !force) return
         if (learnedWordsDirtyCount > 0) {
-            prefs.learnedWordsCsv = suggestionEngine.exportUserWordsCsv(maxWords = 200)
             learnedWordsDirtyCount = 0
+            suggestionExecutor.execute {
+                val csv = suggestionEngine.exportUserWordsCsv(maxWords = 200)
+                if (csv.isNotEmpty()) {
+                    prefs.learnedWordsCsv = csv
+                }
+            }
         }
+    }
+
+    private fun resetLocalTailFrom(text: CharSequence?) {
+        localTail.setLength(0)
+        if (!text.isNullOrEmpty()) {
+            val start = (text.length - MAX_LOCAL_TAIL_LEN).coerceAtLeast(0)
+            localTail.append(text, start, text.length)
+        }
+    }
+
+    private fun appendLocalTail(str: CharSequence) {
+        localTail.append(str)
+        if (localTail.length > MAX_LOCAL_TAIL_LEN) {
+            localTail.delete(0, localTail.length - MAX_LOCAL_TAIL_LEN)
+        }
+    }
+
+    private fun trimLocalTail(count: Int) {
+        if (count <= 0 || localTail.isEmpty()) return
+        val remove = count.coerceAtMost(localTail.length)
+        localTail.delete(localTail.length - remove, localTail.length)
+    }
+
+    private fun syncPreviousWordsFrom(text: CharSequence?) {
+        val (p2, p1) = inputController.extractPreviousTwoWords(text)
+        prevCompletedWord = p2
+        lastCompletedWord = p1
     }
 
     private fun getCurrentSubtypeSafely(): InputMethodSubtype? {
@@ -703,8 +777,6 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
 
         val noSuggestionsFlag = (inputType and InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS) != 0
 
-        // Keep QuickType predictions available in normal, search, filter, and web text fields
-        // (hide only for passwords & pure numeric/phone inputs). Honor NO_SUGGESTIONS by disabling autocorrect.
         fieldSupportsPredictions = !isPassword && !isNumericOnly
         fieldSupportsAutoCorrect = fieldSupportsPredictions && !noSuggestionsFlag && currentVariant == InputVariant.NORMAL
 
@@ -726,34 +798,42 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
         }
     }
 
-    private fun refreshSuggestions(textBeforeOverride: CharSequence? = null) {
+    /**
+     * Computes QuickType suggestions asynchronously off the UI thread so keystrokes
+     * ALWAYS hit the screen immediately with zero latency.
+     */
+    private fun refreshSuggestionsAsync() {
         val kb = keyboardView ?: return
         if (!prefs.predictionBarEnabled || !fieldSupportsPredictions) {
+            suggestionSeq.incrementAndGet()
             kb.setSuggestions(emptyList())
             return
         }
 
-        // Prefer our zero-latency local composing buffer whenever active!
-        val currentWord: String
-        val prevWord: String
-        if (composingWord.isNotEmpty()) {
-            currentWord = composingWord.toString()
-            prevWord = lastCompletedWord
+        val currentWord = if (composingWord.isNotEmpty()) {
+            composingWord.toString()
         } else {
-            val textBefore = textBeforeOverride ?: currentInputConnection?.getTextBeforeCursor(64, 0)
-            currentWord = inputController.extractCurrentWord(textBefore)
-            prevWord = inputController.extractPreviousWord(textBefore).ifEmpty {
-                if (currentWord.isEmpty()) lastCompletedWord else ""
-            }
+            inputController.extractCurrentWord(localTail)
         }
+        val prev1 = lastCompletedWord
+        val prev2 = prevCompletedWord
+        val token = suggestionSeq.incrementAndGet()
 
-        kb.setSuggestions(
-            suggestionEngine.suggest(
+        suggestionExecutor.execute {
+            val results = suggestionEngine.suggest(
                 currentWord = currentWord,
                 maxResults = 3,
-                previousWord = prevWord
+                previousWord = prev1,
+                prevPreviousWord = prev2
             )
-        )
+            if (suggestionSeq.get() == token) {
+                mainHandler.post {
+                    if (suggestionSeq.get() == token) {
+                        keyboardView?.setSuggestions(results)
+                    }
+                }
+            }
+        }
     }
 
     private fun pushKeyboardState() {
@@ -763,6 +843,21 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
             shift = inputController.shiftState,
             returnAction = currentReturnAction
         )
+    }
+
+    /**
+     * Clears any opaque system background on InputMethodService's internal inputFrame / inputArea
+     * parents so Android 12+ live cross-window blur & rounded top corners are genuinely visible!
+     */
+    private fun clearOpaqueSystemInputParents() {
+        val decor = window?.window?.decorView
+        var current = rootContainer?.parent
+        var hops = 0
+        while (current is View && current !== decor && hops < 5) {
+            current.background = null
+            current = current.parent
+            hops++
+        }
     }
 
     private fun registerBlurListenerIfSupported() {
@@ -791,7 +886,6 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
             try {
                 window?.window?.windowManager?.removeCrossWindowBlurEnabledListener(blurEnabledListener)
             } catch (_: Throwable) {
-                // Ignore if window already torn down
             }
             blurListenerRegistered = false
         }
@@ -831,6 +925,7 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
         val imeWindow = window?.window ?: return
         val density = resources.displayMetrics.density
         imeWindow.setFormat(PixelFormat.TRANSLUCENT)
+        imeWindow.addFlags(WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && useLiveBlur) {
             val topR = theme.topCornerRadiusDp * density
@@ -840,21 +935,18 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
                 setColor(theme.effectiveBackdropColor(hardwareBlurActive = true))
             }
             imeWindow.setBackgroundDrawable(bgDrawable)
-            val blurPx = (theme.blurIntensity.blurRadiusDp * density).toInt().coerceIn(12, 140)
+            val blurPx = (theme.blurIntensity.blurRadiusDp * density).toInt().coerceIn(16, 150)
             try {
                 imeWindow.setBackgroundBlurRadius(blurPx)
             } catch (_: Throwable) {
-                // Fallback gracefully if OEM blocks blur radius
             }
         } else {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 try {
                     imeWindow.setBackgroundBlurRadius(0)
                 } catch (_: Throwable) {
-                    // Ignore
                 }
             }
-            // Transparent window background lets our Canvas rounded-top glass/frosted surface clip cleanly
             imeWindow.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
         }
     }
@@ -882,5 +974,9 @@ class IKeysInputMethodService : InputMethodService(), IOSKeyboardView.Callback, 
                 flags or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
             }
         }
+    }
+
+    companion object {
+        private const val MAX_LOCAL_TAIL_LEN = 64
     }
 }

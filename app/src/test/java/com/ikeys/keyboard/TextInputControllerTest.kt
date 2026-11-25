@@ -88,5 +88,8 @@ class TextInputControllerTest {
         assertEquals("Good", ctrl.extractPreviousWord("Good "))
         assertEquals("", ctrl.extractPreviousWord("Good. "))
         assertEquals("terima", ctrl.extractPreviousWord("terima "))
+
+        assertEquals("How" to "are", ctrl.extractPreviousTwoWords("How are "))
+        assertEquals("apa" to "kabar", ctrl.extractPreviousTwoWords("apa kabar h"))
     }
 }

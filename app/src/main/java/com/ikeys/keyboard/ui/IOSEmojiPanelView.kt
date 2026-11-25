@@ -199,7 +199,7 @@ class IOSEmojiPanelView(context: Context) : LinearLayout(context) {
                 cornerRadii = floatArrayOf(topR, topR, topR, topR, 0f, 0f, 0f, 0f)
                 setColor(theme.effectiveBackdropColor(hardwareBlurActive = false))
                 if (theme.isGlassStyle) {
-                    setStroke(dp(1).coerceAtLeast(1), theme.topBorderColor)
+                    setStroke(dp(1).coerceAtLeast(1), theme.topRimOuter)
                 }
             }
         } else {
