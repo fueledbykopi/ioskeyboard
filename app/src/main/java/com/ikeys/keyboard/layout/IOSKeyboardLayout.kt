@@ -1,8 +1,8 @@
 package com.ikeys.keyboard.layout
 
 /**
- * Authentic iOS QWERTY, Symbols (123), and Extended Symbols (#+=) layout definitions
- * plus zero-dead-zone spatial geometry computation.
+ * Authentic latest iOS QWERTY, Symbols (123), and Extended Symbols (#+=) layout definitions
+ * plus zero-dead-zone spatial geometry computation tuned for effortless two-thumb typing.
  */
 object IOSKeyboardLayout {
 
@@ -85,7 +85,7 @@ object IOSKeyboardLayout {
             )
         }
 
-        // Exact iOS Row 3: Shift (1.32) + gap (0.18) + 7 keys + gap (0.18) + Backspace (1.32) = 10.0 units
+        // Exact iOS Row 3: Shift (1.28) + gap (0.22) + 7 keys + gap (0.22) + Backspace (1.28) = 10.0 units
         val row3 = buildList {
             add(
                 KeySpec(
@@ -93,8 +93,8 @@ object IOSKeyboardLayout {
                     label = "",
                     code = KeyCode.SHIFT,
                     type = KeyType.MODIFIER,
-                    weight = 1.32f,
-                    trailingSpacerWeight = 0.18f
+                    weight = 1.28f,
+                    trailingSpacerWeight = 0.22f
                 )
             )
             listOf("z", "x", "c", "v", "b", "n", "m").forEach { ch ->
@@ -106,8 +106,8 @@ object IOSKeyboardLayout {
                     label = "",
                     code = KeyCode.BACKSPACE,
                     type = KeyType.MODIFIER,
-                    weight = 1.32f,
-                    leadingSpacerWeight = 0.18f
+                    weight = 1.28f,
+                    leadingSpacerWeight = 0.22f
                 )
             )
         }
@@ -146,8 +146,8 @@ object IOSKeyboardLayout {
                     label = "#+=",
                     code = KeyCode.MORE_SYMBOLS,
                     type = KeyType.MODIFIER,
-                    weight = 1.32f,
-                    trailingSpacerWeight = 0.18f
+                    weight = 1.28f,
+                    trailingSpacerWeight = 0.22f
                 )
             )
             listOf(".", ",", "?", "!", "'").forEach { ch ->
@@ -159,8 +159,8 @@ object IOSKeyboardLayout {
                     label = "",
                     code = KeyCode.BACKSPACE,
                     type = KeyType.MODIFIER,
-                    weight = 1.32f,
-                    leadingSpacerWeight = 0.18f
+                    weight = 1.28f,
+                    leadingSpacerWeight = 0.22f
                 )
             )
         }
@@ -199,8 +199,8 @@ object IOSKeyboardLayout {
                     label = "123",
                     code = KeyCode.SYMBOLS,
                     type = KeyType.MODIFIER,
-                    weight = 1.32f,
-                    trailingSpacerWeight = 0.18f
+                    weight = 1.28f,
+                    trailingSpacerWeight = 0.22f
                 )
             )
             listOf(".", ",", "?", "!", "'").forEach { ch ->
@@ -212,8 +212,8 @@ object IOSKeyboardLayout {
                     label = "",
                     code = KeyCode.BACKSPACE,
                     type = KeyType.MODIFIER,
-                    weight = 1.32f,
-                    leadingSpacerWeight = 0.18f
+                    weight = 1.28f,
+                    leadingSpacerWeight = 0.22f
                 )
             )
         }
@@ -227,50 +227,29 @@ object IOSKeyboardLayout {
         leftSwitchLabel: String,
         variant: InputVariant
     ): List<KeySpec> {
-        val leftKey = KeySpec(
-            id = "mode_$leftSwitchLabel",
-            label = leftSwitchLabel,
-            code = leftSwitchCode,
-            type = KeyType.MODIFIER,
-            weight = 1.30f
-        )
-        val emojiKey = KeySpec(
-            id = "emoji",
-            label = "",
-            code = KeyCode.EMOJI,
-            type = KeyType.MODIFIER,
-            weight = 1.15f
-        )
-        val returnKey = KeySpec(
-            id = "return",
-            label = "return",
-            code = KeyCode.RETURN,
-            type = KeyType.ACTION,
-            weight = 2.35f
-        )
-
         return when (variant) {
             InputVariant.EMAIL -> listOf(
-                leftKey,
-                emojiKey,
+                KeySpec(id = "mode_$leftSwitchLabel", label = leftSwitchLabel, code = leftSwitchCode, type = KeyType.MODIFIER, weight = 1.28f),
+                KeySpec(id = "emoji", label = "", code = KeyCode.EMOJI, type = KeyType.MODIFIER, weight = 1.12f),
                 KeySpec(id = "space", label = "space", code = KeyCode.SPACE, type = KeyType.SPACE, weight = 3.20f),
                 charKey("@", weight = 1.0f),
                 charKey(".", weight = 1.0f),
-                returnKey
+                KeySpec(id = "return", label = "return", code = KeyCode.RETURN, type = KeyType.ACTION, weight = 2.40f)
             )
             InputVariant.URI -> listOf(
-                leftKey,
-                emojiKey,
+                KeySpec(id = "mode_$leftSwitchLabel", label = leftSwitchLabel, code = leftSwitchCode, type = KeyType.MODIFIER, weight = 1.28f),
+                KeySpec(id = "emoji", label = "", code = KeyCode.EMOJI, type = KeyType.MODIFIER, weight = 1.12f),
                 KeySpec(id = "space", label = "space", code = KeyCode.SPACE, type = KeyType.SPACE, weight = 3.20f),
                 charKey(".", weight = 1.0f),
                 charKey("/", weight = 1.0f),
-                returnKey
+                KeySpec(id = "return", label = "return", code = KeyCode.RETURN, type = KeyType.ACTION, weight = 2.40f)
             )
             InputVariant.NORMAL -> listOf(
-                leftKey,
-                emojiKey,
-                KeySpec(id = "space", label = "space", code = KeyCode.SPACE, type = KeyType.SPACE, weight = 5.20f),
-                returnKey
+                // Exact symmetrical iOS proportions: 1.32 + 1.18 (=2.50) | Space (5.00) | Return (2.50)
+                KeySpec(id = "mode_$leftSwitchLabel", label = leftSwitchLabel, code = leftSwitchCode, type = KeyType.MODIFIER, weight = 1.32f),
+                KeySpec(id = "emoji", label = "", code = KeyCode.EMOJI, type = KeyType.MODIFIER, weight = 1.18f),
+                KeySpec(id = "space", label = "space", code = KeyCode.SPACE, type = KeyType.SPACE, weight = 5.00f),
+                KeySpec(id = "return", label = "return", code = KeyCode.RETURN, type = KeyType.ACTION, weight = 2.50f)
             )
         }
     }
@@ -298,6 +277,8 @@ class KeyboardLayoutEngine {
         val usableWidth = (metrics.width - metrics.horizontalPadding * 2f).coerceAtLeast(1f)
         val halfGapX = metrics.keyHorizontalGap * 0.5f
         val halfGapY = metrics.rowVerticalGap * 0.5f
+        // Slight protective bias so bottom-row letters (Z..M) win over Spacebar at the seam
+        val spaceSeamBias = (metrics.rowVerticalGap * 0.14f).coerceAtMost(metrics.rowHeight * 0.08f)
 
         rows.forEachIndexed { rowIndex, row ->
             if (row.isEmpty()) return@forEachIndexed
@@ -329,8 +310,16 @@ class KeyboardLayoutEngine {
             }
 
             // Compute expanded gap-free touch rects (midpoints between adjacent keys, full edge bleed)
-            val touchTop = if (rowIndex == 0) 0f else rowTop - halfGapY
-            val touchBottom = if (rowIndex == rows.lastIndex) rowBottom + metrics.rowVerticalGap * 2f else rowBottom + halfGapY
+            val touchTop = when (rowIndex) {
+                0 -> 0f
+                rows.lastIndex -> rowTop - halfGapY + spaceSeamBias
+                else -> rowTop - halfGapY
+            }
+            val touchBottom = when (rowIndex) {
+                rows.lastIndex - 1 -> rowBottom + halfGapY + spaceSeamBias
+                rows.lastIndex -> rowBottom + halfGapY
+                else -> rowBottom + halfGapY
+            }
 
             row.forEachIndexed { colIndex, spec ->
                 val draw = drawRects[colIndex]

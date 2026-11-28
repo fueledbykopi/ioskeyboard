@@ -48,8 +48,15 @@ class IOSSoundEngine(context: Context) {
     }
 
     fun refreshRingerMode() {
-        cachedRingerMode = audioManager?.ringerMode ?: AudioManager.RINGER_MODE_NORMAL
-        lastRingerCheckMs = SystemClock.uptimeMillis()
+        if (isReleased) return
+        executor.execute {
+            if (isReleased) return@execute
+            try {
+                cachedRingerMode = audioManager?.ringerMode ?: AudioManager.RINGER_MODE_NORMAL
+                lastRingerCheckMs = SystemClock.uptimeMillis()
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     private fun initAsync() {
@@ -100,9 +107,9 @@ class IOSSoundEngine(context: Context) {
         if (!enabled || isReleased) return
         val pool = soundPool ?: return
         val now = SystemClock.uptimeMillis()
-        if (now - lastRingerCheckMs > 1500L) {
-            cachedRingerMode = audioManager?.ringerMode ?: AudioManager.RINGER_MODE_NORMAL
+        if (now - lastRingerCheckMs > 3000L) {
             lastRingerCheckMs = now
+            refreshRingerMode()
         }
         if (cachedRingerMode != AudioManager.RINGER_MODE_NORMAL) return
 

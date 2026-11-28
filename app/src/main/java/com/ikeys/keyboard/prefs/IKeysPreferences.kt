@@ -50,9 +50,9 @@ enum class HapticStrength(val key: String, val displayName: String, val duration
 }
 
 enum class HeightPreset(val key: String, val displayName: String, val rowHeightDp: Float) {
-    COMPACT("compact", "Compact", 41f),
-    STANDARD("standard", "Standard (iOS)", 45f),
-    TALL("tall", "Tall", 50f);
+    COMPACT("compact", "Compact", 40f),
+    STANDARD("standard", "Standard (iOS)", 44f),
+    TALL("tall", "Tall", 49f);
 
     companion object {
         fun fromKey(key: String?): HeightPreset = entries.firstOrNull { it.key == key } ?: STANDARD
@@ -123,6 +123,10 @@ class IKeysPreferences(context: Context) {
         get() = sharedPrefs.getString(KEY_LEARNED_WORDS, "") ?: ""
         set(value) = sharedPrefs.edit().putString(KEY_LEARNED_WORDS, value).apply()
 
+    var learnedBigramsCsv: String
+        get() = sharedPrefs.getString(KEY_LEARNED_BIGRAMS, "") ?: ""
+        set(value) = sharedPrefs.edit().putString(KEY_LEARNED_BIGRAMS, value).apply()
+
     fun registerListener(listener: SharedPreferences.OnSharedPreferenceChangeListener) {
         sharedPrefs.registerOnSharedPreferenceChangeListener(listener)
     }
@@ -147,5 +151,6 @@ class IKeysPreferences(context: Context) {
         private const val KEY_BOTTOM_CHIN = "bottom_chin"
         private const val KEY_HEIGHT_PRESET = "height_preset"
         private const val KEY_LEARNED_WORDS = "learned_words_csv"
+        private const val KEY_LEARNED_BIGRAMS = "learned_bigrams_csv"
     }
 }

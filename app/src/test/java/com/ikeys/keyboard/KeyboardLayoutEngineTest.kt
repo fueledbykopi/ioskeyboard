@@ -89,4 +89,21 @@ class KeyboardLayoutEngineTest {
         assertTrue(lowerAlts.contains("á"))
         assertTrue(upperAlts.contains("Á"))
     }
+
+    @Test
+    fun bottomRowMatchesSymmetricalIOSProportionsAndSeamBias() {
+        val keys = engine.computeKeys(IOSKeyboardLayout.rowsFor(KeyboardMode.ALPHA), defaultMetrics)
+        val spaceKey = keys.first { it.spec.code == KeyCode.SPACE }
+        val returnKey = keys.first { it.spec.code == KeyCode.RETURN }
+        val keyB = keys.first { it.spec.label == "b" }
+
+        // Spacebar sits centered across middle 50% of the keyboard
+        assertEquals(defaultMetrics.width * 0.5f, spaceKey.drawRect.centerX, 2f)
+        // Return key occupies 25% right block
+        assertTrue(returnKey.drawRect.width > defaultMetrics.width * 0.22f)
+        // Seam midpoint between Row 3 ('b') and Spacebar favors letter 'b' to prevent accidental space hits
+        val exactMidY = (keyB.drawRect.bottom + spaceKey.drawRect.top) * 0.5f
+        val seamHit = engine.findKeyAt(keys, keyB.drawRect.centerX, exactMidY)
+        assertEquals("b", seamHit?.spec?.label)
+    }
 }
